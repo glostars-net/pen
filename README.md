@@ -8,11 +8,11 @@
     ╵
 ```
 
-Pen is an open-source (MIT), offline code editor built in Rust on
+Pen is an open-source (MIT), offline-first code editor built in Rust on
 [Rune](https://github.com/anomalyco/rune) (`wgpu` SDF rendering, Parley/Swash
 text shaping, Taffy layout — no webview, HTML, CSS, or browser engine).
 
-- **Offline & private.** Zero runtime network calls, zero telemetry.
+- **Offline-first & private.** No telemetry, ever, and no background or automatic network calls. Git operations you invoke (fetch, push, pull) connect only when you ask them to; everything else — open, edit, save, find — works fully offline.
 - **Cross-platform, all desktop architectures.** macOS (`aarch64` Apple silicon & `x86_64` Intel), Windows (`x86_64` & `aarch64`), and Linux (`x86_64` & `aarch64`).
 - **Fast on large files.** Only the visible viewport (+ 8 lines of overscan) is shaped or syntax-highlighted; keystrokes never wait on disk I/O.
 
@@ -32,11 +32,18 @@ Rune rev: d8f89f83e10d99ad65ca525a73b28edcc64fbcb7
 
 Requires Rust `1.99.1` (pinned automatically by `rust-toolchain.toml`).
 
-```sh
-# Open Pen on the empty page ("Open a folder"):
-cargo run --release -p pen
+With [`just`](https://github.com/casey/just) (`brew install just`):
 
-# Or open a project folder directly:
+```sh
+just run                       # Open Pen on the empty page ("Open a folder")
+just run /path/to/folder       # Or open a project folder directly
+just gate                      # fmt check + clippy + tests + perf budgets, in one command
+```
+
+Without `just`, the plain cargo form works the same:
+
+```sh
+cargo run --release -p pen
 cargo run --release -p pen -- /path/to/folder
 ```
 

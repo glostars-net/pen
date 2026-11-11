@@ -1,6 +1,6 @@
 # Pen Architecture
 
-Pen is an offline, MIT-licensed desktop code editor written in Rust on top of
+Pen is an offline-first, MIT-licensed desktop code editor written in Rust on top of
 [Rune](https://github.com/anomalyco/rune) (`wgpu` SDF + Parley/Swash text + Taffy
 layout). There is no webview, HTML, CSS, or JavaScript runtime.
 
@@ -39,6 +39,11 @@ performance or visual discipline.
    or user `theme.json` — goes through `highlight::load_theme`. Any `accent` or
    `syntax` override under 4.5:1 WCAG contrast against `bg` is dropped in favor
    of the OKLab ink ramp.
+8. **No telemetry, no background network.** Pen never phones home and never
+   makes an unsolicited network call. Network use is opt-in and scoped to the
+   action that needs it: Phase 2 git fetch/push/pull run only when a user picks
+   that command, over the system's own `git` binary or `gix`'s own transport.
+   Phase 1's editing, saving, and search stay fully offline with no exception.
 
 ---
 
