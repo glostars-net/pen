@@ -1,0 +1,13 @@
+[package]
+name = "buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pen's rope text buffer: edits, undo, viewport slices, IME commit boundary."
+
+[dependencies]
+ropey.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
