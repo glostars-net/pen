@@ -36,14 +36,14 @@ performance or visual discipline.
    `Project::write_atomic` reject absolute paths, `..` components, and escaping
    symlinks with `ProjectError::OutsideRoot`.
 7. **Contrast floor (>= 4.5:1).** Every theme — built-in Ink, built-in Paper,
-   or user `theme.json` — goes through `highlight::load_theme`. Any `accent` or
-   `syntax` override under 4.5:1 WCAG contrast against `bg` is dropped in favor
-   of the OKLab ink ramp.
+   or user `theme.json` — goes through `highlight::load_theme`. Any `accent`,
+   `syntax`, `added`, or `removed` override under 4.5:1 WCAG contrast against
+   `bg` is dropped in favor of the OKLab ink ramp.
 8. **No telemetry, no background network.** Pen never phones home and never
    makes an unsolicited network call. Network use is opt-in and scoped to the
-   action that needs it: Phase 2 git fetch/push/pull run only when a user picks
-   that command, over the system's own `git` binary or `gix`'s own transport.
-   Phase 1's editing, saving, and search stay fully offline with no exception.
+   action that needs it: Phase 2 git fetch/push/merge run only when a user
+   picks that command, over the system's own `git` binary. Phase 1's editing,
+   saving, and search stay fully offline with no exception.
 
 ---
 

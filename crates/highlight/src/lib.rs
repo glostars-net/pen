@@ -346,6 +346,18 @@ mod tests {
     }
 
     #[test]
+    fn low_contrast_added_and_removed_are_dropped() {
+        let t = load_theme(
+            r##"{"name":"x","bg":"#ffffff","fg":"#111111","added":"#eeeeee","removed":"#f2f2f2"}"##,
+        )
+        .unwrap();
+        assert_ne!(t.added, Rgb::from_hex("#eeeeee"));
+        assert_ne!(t.removed, Rgb::from_hex("#f2f2f2"));
+        assert!(contrast_ratio(t.added, t.bg) >= 4.5);
+        assert!(contrast_ratio(t.removed, t.bg) >= 4.5);
+    }
+
+    #[test]
     fn highlight_lines_colors_rust_viewport() {
         let lines = vec![
             "fn main() {".to_owned(),

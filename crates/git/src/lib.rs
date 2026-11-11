@@ -6,6 +6,7 @@
 
 pub mod cli;
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +23,12 @@ pub enum GitError {
     EmptyMessage,
     #[error("Set git user.name and user.email.")]
     NoIdentity,
+    #[error("Stage changes before committing.")]
+    NothingToCommit,
+    #[error("Resolve merge conflicts before committing.")]
+    UnmergedConflict,
+    #[error("{0}")]
+    CheckoutConflict(String),
     #[error("invalid reference name: {0}")]
     InvalidRef(String),
     #[error("git command is not in the allow-list")]
@@ -32,6 +39,14 @@ pub enum GitError {
 
 pub struct Repo {
     inner: gix::Repository,
+    /// Canonical project root (`start` passed to `discover`, confined inside
+    /// `workdir`). When the user opens a subdirectory of a git repo in Pen, all
+    /// relative paths are anchored and confined to `scope_root`, not the outer
+    /// repo root.
+    scope_root: PathBuf,
+    /// Slash-separated prefix from `workdir` to `scope_root` (`""` when opened
+    /// at the repository root).
+    scope_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,19 +78,42 @@ impl Repo {
     /// Discover a repository starting at (or above) `start`. `Ok(None)` when
     /// no repository is found; any other failure is a real `GitError`.
     pub fn discover(start: &Path) -> Result<Option<Self>, GitError> {
-        match gix::discover(start) {
-            Ok(inner) => Ok(Some(Repo { inner })),
+        let inner = match gix::discover(start) {
+            Ok(inner) => inner,
             Err(err) => {
-                if err
+                return if err
                     .downcast_any_ref::<gix::discover::upwards::Error>()
                     .is_some()
                 {
                     Ok(None)
                 } else {
                     Err(GitError::Gix(err))
+                };
+            }
+        };
+        let (scope_root, scope_prefix) = match inner.workdir() {
+            Some(wd) => {
+                let canon_wd = std::fs::canonicalize(wd).unwrap_or_else(|_| wd.to_path_buf());
+                let canon_start = std::fs::canonicalize(start).unwrap_or_else(|_| canon_wd.clone());
+                match canon_start.strip_prefix(&canon_wd) {
+                    Ok(sub) if !sub.as_os_str().is_empty() => {
+                        let pfx = sub
+                            .components()
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        (canon_start, pfx)
+                    }
+                    _ => (canon_wd, String::new()),
                 }
             }
-        }
+            None => (PathBuf::new(), String::new()),
+        };
+        Ok(Some(Repo {
+            inner,
+            scope_root,
+            scope_prefix,
+        }))
     }
 
     /// The worktree root, or a `GitError` for a bare repository (Pen only
@@ -84,11 +122,25 @@ impl Repo {
         self.inner.workdir().ok_or(GitError::BareRepository)
     }
 
-    /// Validate `rel` against the repository's canonical worktree root using
-    /// the same escape rules as `Project::read`: rejects empty/absolute/`..`
-    /// components and symlinks whose targets leave the worktree root. Returns
-    /// `(joined_path, slash_separated_rel)`.
+    /// Map a repository-relative slash path (`"sub/Cargo.toml"`) into a
+    /// `scope_root`-relative `PathBuf` (`"Cargo.toml"`), or `None` if it lies
+    /// outside `scope_root`.
+    fn strip_scope(&self, repo_slash: &str) -> Option<PathBuf> {
+        if self.scope_prefix.is_empty() {
+            return (!repo_slash.is_empty()).then(|| PathBuf::from(repo_slash));
+        }
+        let rest = repo_slash
+            .strip_prefix(&self.scope_prefix)?
+            .strip_prefix('/')?;
+        (!rest.is_empty()).then(|| PathBuf::from(rest))
+    }
+
+    /// Validate `rel` against `scope_root` using the same escape rules as
+    /// `Project::read`: rejects empty/absolute/`..` components and symlinks
+    /// (including symlinks above nonexistent intermediate directories) whose
+    /// targets leave `scope_root`. Returns `(joined_disk_path, repo_slash)`.
     fn checked_rel(&self, rel: &Path) -> Result<(PathBuf, String), GitError> {
+        let _ = self.workdir()?;
         if rel.as_os_str().is_empty() || rel.is_absolute() {
             return Err(GitError::OutsideRoot(rel.to_path_buf()));
         }
@@ -113,65 +165,168 @@ impl Repo {
         if parts.is_empty() {
             return Err(GitError::OutsideRoot(rel.to_path_buf()));
         }
-        let canon_root = std::fs::canonicalize(self.workdir()?)?;
-        let joined = canon_root.join(rel);
+        let joined = self.scope_root.join(rel);
         if let Ok(meta) = std::fs::symlink_metadata(&joined) {
             let canon = std::fs::canonicalize(&joined)
                 .map_err(|_| GitError::OutsideRoot(rel.to_path_buf()))?;
-            if !canon.starts_with(&canon_root) || meta.is_dir() {
+            if !canon.starts_with(&self.scope_root) || meta.is_dir() {
                 return Err(GitError::OutsideRoot(rel.to_path_buf()));
             }
-        } else if let Some(parent) = joined.parent()
-            && parent.exists()
-        {
-            let canon_parent = std::fs::canonicalize(parent)?;
-            if !canon_parent.starts_with(&canon_root) {
+        } else {
+            // Walk ancestors to the nearest existing path on disk and verify it
+            // stays inside `scope_root` (catches `symlink_out/missing/file`).
+            let nearest = joined
+                .ancestors()
+                .skip(1)
+                .find(|p| std::fs::symlink_metadata(p).is_ok())
+                .ok_or_else(|| GitError::OutsideRoot(rel.to_path_buf()))?;
+            let canon_anc = std::fs::canonicalize(nearest)
+                .map_err(|_| GitError::OutsideRoot(rel.to_path_buf()))?;
+            if !canon_anc.starts_with(&self.scope_root) {
                 return Err(GitError::OutsideRoot(rel.to_path_buf()));
             }
         }
-        Ok((joined, parts.join("/")))
+        let rel_slash = parts.join("/");
+        let repo_slash = if self.scope_prefix.is_empty() {
+            rel_slash
+        } else {
+            format!("{}/{rel_slash}", self.scope_prefix)
+        };
+        Ok((joined, repo_slash))
     }
 
-    /// Changes between the index and the worktree: modified tracked files
-    /// (with line-level `added`/`removed` counts) and untracked files (with
-    /// `added: 0, removed: 0`, so they still appear in the tree).
+    /// Staged (`HEAD` vs index) and unstaged (`index` vs worktree) changes
+    /// confined to `scope_root`, with individual untracked files expanded.
     pub fn status(&self) -> Result<Vec<StatusEntry>, GitError> {
         let workdir = self.workdir()?;
-        let platform = self.inner.status(gix::progress::Discard)?;
+        let platform = self
+            .inner
+            .status(gix::progress::Discard)?
+            .untracked_files(gix::status::UntrackedFiles::Files);
         let iter = platform.into_iter(Vec::<gix::bstr::BString>::new())?;
-        let mut entries = Vec::new();
+        let mut by_rel: BTreeMap<PathBuf, StatusEntry> = BTreeMap::new();
+        let mut head_oids: HashMap<PathBuf, Option<gix::ObjectId>> = HashMap::new();
+
         for item in iter {
             let item = item?;
-            let gix::status::Item::IndexWorktree(iw) = item else {
-                continue;
-            };
-            match iw {
-                gix::status::index_worktree::Item::Modification {
-                    entry, rela_path, ..
-                } => {
-                    let rel = PathBuf::from(rela_path.to_string());
-                    let (added, removed) = self.line_stats(workdir, &rel, entry.id);
-                    entries.push(StatusEntry {
-                        rel,
-                        added,
-                        removed,
-                        tracked: true,
-                    });
+            match item {
+                gix::status::Item::TreeIndex(change) => {
+                    use gix::diff::index::ChangeRef;
+                    match change {
+                        ChangeRef::Addition { location, id, .. } => {
+                            let repo_slash = location.to_string();
+                            let Some(rel) = self.strip_scope(&repo_slash) else {
+                                continue;
+                            };
+                            let (added, removed) =
+                                self.blob_stats(None, Some(id.as_ref().to_owned()));
+                            head_oids.insert(rel.clone(), None);
+                            by_rel.insert(
+                                rel.clone(),
+                                StatusEntry {
+                                    rel,
+                                    added,
+                                    removed,
+                                    tracked: added > 0 || removed > 0,
+                                },
+                            );
+                        }
+                        ChangeRef::Deletion { location, id, .. } => {
+                            let repo_slash = location.to_string();
+                            let Some(rel) = self.strip_scope(&repo_slash) else {
+                                continue;
+                            };
+                            let old_oid = id.as_ref().to_owned();
+                            let (added, removed) = self.blob_stats(Some(old_oid), None);
+                            head_oids.insert(rel.clone(), Some(old_oid));
+                            by_rel.insert(
+                                rel.clone(),
+                                StatusEntry {
+                                    rel,
+                                    added,
+                                    removed: removed.max(1),
+                                    tracked: true,
+                                },
+                            );
+                        }
+                        ChangeRef::Modification {
+                            location,
+                            previous_id,
+                            id,
+                            ..
+                        } => {
+                            let repo_slash = location.to_string();
+                            let Some(rel) = self.strip_scope(&repo_slash) else {
+                                continue;
+                            };
+                            let prev = previous_id.as_ref().to_owned();
+                            let (added, removed) =
+                                self.blob_stats(Some(prev), Some(id.as_ref().to_owned()));
+                            head_oids.insert(rel.clone(), Some(prev));
+                            by_rel.insert(
+                                rel.clone(),
+                                StatusEntry {
+                                    rel,
+                                    added,
+                                    removed,
+                                    tracked: true,
+                                },
+                            );
+                        }
+                        ChangeRef::Rewrite { .. } => {}
+                    }
                 }
-                gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
-                    entries.push(StatusEntry {
-                        rel: PathBuf::from(entry.rela_path.to_string()),
-                        added: 0,
-                        removed: 0,
-                        tracked: false,
-                    });
-                }
-                // Rename/copy pairs: not tracked unless rewrite tracking is turned on,
-                // which this platform doesn't enable, so this arm is unreached today.
-                gix::status::index_worktree::Item::Rewrite { .. } => {}
+                gix::status::Item::IndexWorktree(iw) => match iw {
+                    gix::status::index_worktree::Item::Modification {
+                        entry, rela_path, ..
+                    } => {
+                        let repo_slash = rela_path.to_string();
+                        let Some(rel) = self.strip_scope(&repo_slash) else {
+                            continue;
+                        };
+                        let base_oid = head_oids.get(&rel).copied().unwrap_or(Some(entry.id));
+                        let (added, removed) =
+                            self.line_stats(workdir, Path::new(&repo_slash), base_oid);
+                        let tracked = base_oid.is_some() || added > 0 || removed > 0;
+                        by_rel.insert(
+                            rel.clone(),
+                            StatusEntry {
+                                rel,
+                                added,
+                                removed,
+                                tracked,
+                            },
+                        );
+                    }
+                    gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
+                        if matches!(
+                            entry.disk_kind,
+                            Some(
+                                gix::dir::entry::Kind::Directory
+                                    | gix::dir::entry::Kind::Repository
+                            )
+                        ) {
+                            continue;
+                        }
+                        let repo_slash = entry.rela_path.to_string();
+                        let Some(rel) = self.strip_scope(&repo_slash) else {
+                            continue;
+                        };
+                        by_rel.insert(
+                            rel.clone(),
+                            StatusEntry {
+                                rel,
+                                added: 0,
+                                removed: 0,
+                                tracked: false,
+                            },
+                        );
+                    }
+                    gix::status::index_worktree::Item::Rewrite { .. } => {}
+                },
             }
         }
-        Ok(entries)
+        Ok(by_rel.into_values().collect())
     }
 
     /// Walk up to `limit` commits reachable from `HEAD`, newest first. An
@@ -199,13 +354,23 @@ impl Repo {
         Ok(out)
     }
 
-    /// Unstaged unified patch for `rel` against the index. Returns
-    /// `GitError::OutsideRoot` when `rel` climbs out of the worktree root.
+    /// Unstaged unified patch for `rel` against the index (falling back to
+    /// `HEAD` when `rel` is already staged cleanly in the index). Returns
+    /// `GitError::OutsideRoot` when `rel` climbs out of `scope_root`.
     pub fn diff_worktree(&self, rel: &Path) -> Result<String, GitError> {
         use gix::bstr::ByteSlice;
-        let (joined, slash) = self.checked_rel(rel)?;
+        let (joined, repo_slash) = self.checked_rel(rel)?;
+        let display_slash = self
+            .strip_scope(&repo_slash)
+            .map(|p| {
+                p.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_else(|| repo_slash.clone());
         let index = self.inner.index_or_empty()?;
-        let old_bytes = match index.entry_by_path(slash.as_bytes().as_bstr()) {
+        let mut old_bytes = match index.entry_by_path(repo_slash.as_bytes().as_bstr()) {
             Some(entry) => Some(self.inner.find_object(entry.id)?.detach().data),
             None => None,
         };
@@ -214,12 +379,37 @@ impl Repo {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(GitError::Io(e)),
         };
+        // When a file has been staged and matches the worktree, show its staged diff against HEAD.
+        if old_bytes == new_bytes {
+            old_bytes = self.head_blob_bytes(&repo_slash);
+        }
         Ok(unified_file_patch(
-            &slash,
-            &slash,
+            &display_slash,
+            &display_slash,
             old_bytes.as_deref(),
             new_bytes.as_deref(),
         ))
+    }
+
+    fn head_blob_bytes(&self, repo_slash: &str) -> Option<Vec<u8>> {
+        let head = self.inner.head().ok()?;
+        if head.is_unborn() {
+            return None;
+        }
+        let tree_id = head
+            .into_peeled_id()
+            .ok()?
+            .object()
+            .ok()?
+            .peel_to_commit()
+            .ok()?
+            .tree_id()
+            .ok()?
+            .detach();
+        let head_idx = self.inner.index_from_tree(&tree_id).ok()?;
+        use gix::bstr::ByteSlice;
+        let entry = head_idx.entry_by_path(repo_slash.as_bytes().as_bstr())?;
+        Some(self.inner.find_object(entry.id).ok()?.detach().data)
     }
 
     /// Unified patch introduced by commit `id` (short or full hex) against its
@@ -313,12 +503,11 @@ impl Repo {
         use gix::index::entry::{Flags, Mode, Stage, Stat};
 
         let (joined, slash) = self.checked_rel(rel)?;
-        let mut index = match self.inner.open_index() {
-            Ok(file) => file,
-            Err(_) => gix::index::File::from_state(
-                gix::index::State::new(self.inner.object_hash()),
-                self.inner.index_path(),
-            ),
+        let idx_path = self.inner.index_path();
+        let mut index = if idx_path.exists() {
+            self.inner.open_index()?
+        } else {
+            gix::index::File::from_state(gix::index::State::new(self.inner.object_hash()), idx_path)
         };
         index.remove_entries(|_, path, _| path == slash.as_bytes().as_bstr());
 
@@ -378,12 +567,17 @@ impl Repo {
         }
 
         let index = self.inner.index_or_empty()?;
+        if index
+            .entries()
+            .iter()
+            .any(|e| e.stage() != Stage::Unconflicted)
+        {
+            return Err(GitError::UnmergedConflict);
+        }
+
         let empty = self.inner.empty_tree();
         let mut editor = empty.edit()?;
         for entry in index.entries() {
-            if entry.stage() != Stage::Unconflicted {
-                continue;
-            }
             let kind = match entry.mode {
                 Mode::FILE => EntryKind::Blob,
                 Mode::FILE_EXECUTABLE => EntryKind::BlobExecutable,
@@ -396,12 +590,30 @@ impl Repo {
         }
         let tree_id = editor.write()?.detach();
 
+        let merge_head_path = self.inner.git_dir().join("MERGE_HEAD");
+        let merge_parent = std::fs::read_to_string(&merge_head_path)
+            .ok()
+            .and_then(|s| s.lines().next().map(str::trim).map(ToOwned::to_owned))
+            .and_then(|hex| gix::ObjectId::from_hex(hex.as_bytes()).ok());
+
         let head = self.inner.head()?;
-        let parents: Vec<gix::ObjectId> = if head.is_unborn() {
+        let mut parents: Vec<gix::ObjectId> = if head.is_unborn() {
+            if tree_id == empty.id {
+                return Err(GitError::NothingToCommit);
+            }
             Vec::new()
         } else {
-            vec![head.into_peeled_id()?.detach()]
+            let head_commit = head.into_peeled_id()?.object()?.peel_to_commit()?;
+            let head_tree_id = head_commit.tree_id()?.detach();
+            if merge_parent.is_none() && tree_id == head_tree_id {
+                return Err(GitError::NothingToCommit);
+            }
+            vec![head_commit.id]
         };
+        if let Some(mp) = merge_parent {
+            parents.push(mp);
+        }
+
         let mut msg = message.to_owned();
         if !msg.ends_with('\n') {
             msg.push('\n');
@@ -410,6 +622,11 @@ impl Repo {
             .inner
             .commit_as(committer, author, "HEAD", &msg, tree_id, parents)?
             .detach();
+        if merge_parent.is_some() {
+            let _ = std::fs::remove_file(&merge_head_path);
+            let _ = std::fs::remove_file(self.inner.git_dir().join("MERGE_MSG"));
+            let _ = std::fs::remove_file(self.inner.git_dir().join("MERGE_MODE"));
+        }
         Ok(oid.to_string())
     }
 
@@ -439,31 +656,146 @@ impl Repo {
         Ok(names)
     }
 
-    /// Switch the worktree, index, and symbolic `HEAD` to local branch `name`.
+    /// Switch the worktree, index, and symbolic `HEAD` to local branch `name`,
+    /// refusing before mutating disk or `.git/index` if staged edits, unstaged
+    /// edits, colliding untracked files, or another linked worktree would
+    /// conflict.
     pub fn checkout(&self, name: &str) -> Result<(), GitError> {
         use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
         use gix::refs::{FullName, Target};
         use std::sync::atomic::AtomicBool;
 
-        let workdir = self.workdir()?.to_path_buf();
-        let full_name = FullName::try_from(format!("refs/heads/{}", name.trim()))
+        let workdir = std::fs::canonicalize(self.workdir()?)?;
+        let trimmed = name.trim();
+        let full_name = FullName::try_from(format!("refs/heads/{trimmed}"))
             .map_err(|e| GitError::InvalidRef(e.to_string()))?;
+
+        // Refuse if `full_name` is already checked out in a different worktree.
+        for wt_res in self.inner.worktrees_including_main()? {
+            let wt = wt_res?;
+            let Some(wt_dir) = wt.workdir() else {
+                continue;
+            };
+            let canon_wt = std::fs::canonicalize(wt_dir).unwrap_or_else(|_| wt_dir.to_path_buf());
+            if canon_wt != workdir && wt.head_name()?.as_ref() == Some(&full_name) {
+                return Err(GitError::CheckoutConflict(format!(
+                    "Branch {trimmed} is already checked out in {}.",
+                    canon_wt.display()
+                )));
+            }
+        }
+
         let mut reference = self.inner.find_reference(&full_name)?;
         let commit = reference.peel_to_commit()?;
         let tree_id = commit.tree_id()?.detach();
 
+        let head = self.inner.head()?;
+        let head_index = if head.is_unborn() {
+            None
+        } else {
+            let ht = head
+                .into_peeled_id()?
+                .object()?
+                .peel_to_commit()?
+                .tree_id()?
+                .detach();
+            Some(self.inner.index_from_tree(&ht)?)
+        };
+
         let old_index = self.inner.index_or_empty()?;
         let mut new_index = self.inner.index_from_tree(&tree_id)?;
 
-        // Remove tracked files present in the old index that disappear in the target tree.
+        // 1. Refuse if there are staged changes between HEAD and current index.
+        if let Some(h_idx) = &head_index {
+            if h_idx.entries().len() != old_index.entries().len() {
+                return Err(GitError::CheckoutConflict(
+                    "Commit or discard staged changes before switching branches.".into(),
+                ));
+            }
+            for e in old_index.entries() {
+                let p = e.path(&old_index);
+                if h_idx.entry_by_path(p).map(|he| he.id) != Some(e.id) {
+                    return Err(GitError::CheckoutConflict(
+                        "Commit or discard staged changes before switching branches.".into(),
+                    ));
+                }
+            }
+        } else if !old_index.entries().is_empty() {
+            return Err(GitError::CheckoutConflict(
+                "Commit or discard staged changes before switching branches.".into(),
+            ));
+        }
+
+        // 2. Refuse if any tracked file has unstaged modifications/deletions on disk.
+        for old_entry in old_index.entries() {
+            let rel_bstr = old_entry.path(&old_index);
+            let Ok(rel_str) = std::str::from_utf8(rel_bstr.as_ref()) else {
+                continue;
+            };
+            let disk_path = workdir.join(rel_str);
+            let matches_index = match std::fs::symlink_metadata(&disk_path) {
+                Ok(meta) if meta.file_type().is_symlink() => std::fs::read_link(&disk_path)
+                    .ok()
+                    .and_then(|t| {
+                        gix::objs::compute_hash(
+                            self.inner.object_hash(),
+                            gix::objs::Kind::Blob,
+                            t.to_string_lossy().as_bytes(),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|oid| oid == old_entry.id),
+                Ok(meta) if meta.is_file() => std::fs::read(&disk_path)
+                    .ok()
+                    .and_then(|bytes| {
+                        gix::objs::compute_hash(
+                            self.inner.object_hash(),
+                            gix::objs::Kind::Blob,
+                            &bytes,
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|oid| oid == old_entry.id),
+                _ => false,
+            };
+            if !matches_index {
+                return Err(GitError::CheckoutConflict(format!(
+                    "Local changes to {rel_str} would be overwritten by checkout."
+                )));
+            }
+        }
+
+        // 3. Refuse if an untracked file/directory on disk collides with a newly introduced path.
+        for new_entry in new_index.entries() {
+            let rel_bstr = new_entry.path(&new_index);
+            if old_index.entry_by_path(rel_bstr).is_none()
+                && let Ok(rel_str) = std::str::from_utf8(rel_bstr.as_ref())
+            {
+                let disk_path = workdir.join(rel_str);
+                if std::fs::symlink_metadata(&disk_path).is_ok() {
+                    return Err(GitError::CheckoutConflict(format!(
+                        "Untracked file {rel_str} would be overwritten by checkout."
+                    )));
+                }
+            }
+        }
+
+        // Safe to mutate: remove tracked files disappearing in the target tree and prune empty dirs.
         for old_entry in old_index.entries() {
             let rel_bstr = old_entry.path(&old_index);
             if new_index.entry_by_path(rel_bstr).is_none()
                 && let Ok(rel_str) = std::str::from_utf8(rel_bstr.as_ref())
             {
                 let path = workdir.join(rel_str);
-                if path.is_file() {
+                if path.is_file() || path.is_symlink() {
                     let _ = std::fs::remove_file(&path);
+                    let mut dir_opt = path.parent();
+                    while let Some(dir) = dir_opt {
+                        if dir == workdir || std::fs::remove_dir(dir).is_err() {
+                            break;
+                        }
+                        dir_opt = dir.parent();
+                    }
                 }
             }
         }
@@ -498,7 +830,7 @@ impl Repo {
         self.inner.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
-                    message: format!("checkout: moving to {}", name.trim()).into(),
+                    message: format!("checkout: moving to {trimmed}").into(),
                     ..Default::default()
                 },
                 expected: PreviousValue::Any,
@@ -592,6 +924,11 @@ impl Repo {
         }
         let full_name = FullName::try_from(format!("refs/heads/{trimmed}"))
             .map_err(|e| GitError::InvalidRef(e.to_string()))?;
+        let resolved_dest = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.workdir()?.join(path)
+        };
         if self.inner.find_reference(&full_name).is_err() {
             let head_id = self.inner.head_id()?.detach();
             self.inner.reference(
@@ -600,12 +937,25 @@ impl Repo {
                 PreviousValue::MustNotExist,
                 "branch: Created from HEAD",
             )?;
+            let result = self.inner.add_worktree(
+                &resolved_dest,
+                gix::worktree::add::Head::Attached(full_name.clone()),
+                gix::progress::Discard,
+                &AtomicBool::new(false),
+            );
+            if result.is_err() {
+                let _ = self.inner.edit_reference(gix::refs::transaction::RefEdit {
+                    change: gix::refs::transaction::Change::Delete {
+                        expected: PreviousValue::Any,
+                        log: gix::refs::transaction::RefLog::AndReference,
+                    },
+                    name: full_name,
+                    deref: false,
+                });
+                result?;
+            }
+            return Ok(());
         }
-        let resolved_dest = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.workdir()?.join(path)
-        };
         self.inner.add_worktree(
             &resolved_dest,
             gix::worktree::add::Head::Attached(full_name),
@@ -616,35 +966,54 @@ impl Repo {
     }
 
     /// Remove a linked worktree at `path` without force (dirty or locked
-    /// worktrees are refused). Confirmation belongs to the UI caller.
+    /// worktrees are refused). Relative paths resolve against the worktree
+    /// root, matching `add_worktree`. Confirmation belongs to the UI caller.
     pub fn remove_worktree(&self, path: &Path) -> Result<(), GitError> {
-        let target = self.inner.prepare_remove_worktree(path)?;
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.workdir()?.join(path)
+        };
+        let target = self.inner.prepare_remove_worktree(&resolved)?;
         target.remove(gix::worktree::remove::Force::Never, gix::progress::Discard)?;
         Ok(())
     }
 
-    /// Line-level `(added, removed)` between the index blob at `id` and the
-    /// worktree file at `root/rel`. Binary or non-UTF-8 content (either
-    /// side) returns `(0, 0)`: Pen is UTF-8 only (see phase 1), and a byte
-    /// diff wouldn't count as meaningful lines anyway.
-    fn line_stats(&self, root: &Path, rel: &Path, id: gix::ObjectId) -> (u32, u32) {
-        let old = self
-            .inner
-            .find_object(id)
-            .ok()
-            .map(|o| o.data.clone())
+    /// Line-level `(added, removed)` between an optional blob `id` and the
+    /// worktree file at `root/rel`. Binary or non-UTF-8 content returns `(0, 0)`.
+    fn line_stats(&self, root: &Path, rel: &Path, id: Option<gix::ObjectId>) -> (u32, u32) {
+        let old = id
+            .and_then(|oid| self.inner.find_object(oid).ok().map(|o| o.detach().data))
             .unwrap_or_default();
         let new = std::fs::read(root.join(rel)).unwrap_or_default();
-        let (Ok(old), Ok(new)) = (std::str::from_utf8(&old), std::str::from_utf8(&new)) else {
-            return (0, 0);
-        };
-        let input = gix::diff::blob::InternedInput::new(
-            gix::diff::blob::sources::lines(old),
-            gix::diff::blob::sources::lines(new),
-        );
-        let diff = gix::diff::blob::Diff::compute(gix::diff::blob::Algorithm::Histogram, &input);
-        (diff.count_additions(), diff.count_removals())
+        diff_utf8_stats(&old, &new)
     }
+
+    fn blob_stats(
+        &self,
+        old_id: Option<gix::ObjectId>,
+        new_id: Option<gix::ObjectId>,
+    ) -> (u32, u32) {
+        let old = old_id
+            .and_then(|oid| self.inner.find_object(oid).ok().map(|o| o.detach().data))
+            .unwrap_or_default();
+        let new = new_id
+            .and_then(|oid| self.inner.find_object(oid).ok().map(|o| o.detach().data))
+            .unwrap_or_default();
+        diff_utf8_stats(&old, &new)
+    }
+}
+
+fn diff_utf8_stats(old: &[u8], new: &[u8]) -> (u32, u32) {
+    let (Ok(old), Ok(new)) = (std::str::from_utf8(old), std::str::from_utf8(new)) else {
+        return (0, 0);
+    };
+    let input = gix::diff::blob::InternedInput::new(
+        gix::diff::blob::sources::lines(old),
+        gix::diff::blob::sources::lines(new),
+    );
+    let diff = gix::diff::blob::Diff::compute(gix::diff::blob::Algorithm::Histogram, &input);
+    (diff.count_additions(), diff.count_removals())
 }
 
 fn unified_file_patch(
@@ -968,6 +1337,201 @@ mod tests {
         repo.remove_worktree(&linked_dir).unwrap();
         assert!(!linked_dir.exists());
         assert_eq!(repo.worktrees().unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn checkout_refuses_to_clobber_saved_uncommitted_or_untracked_files() {
+        let dir = std::env::temp_dir().join(format!("pen-git-co-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "c1"]);
+
+        git(&dir, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(dir.join("a.txt"), "v2\n").unwrap();
+        std::fs::write(dir.join("new_on_other.txt"), "other\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "c2"]);
+        git(&dir, &["checkout", "-q", "main"]);
+
+        // 1. Saved unstaged modification to `a.txt` must block checkout to `other`.
+        std::fs::write(dir.join("a.txt"), "unsaved-to-git-on-disk\n").unwrap();
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(repo.checkout("other").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "unsaved-to-git-on-disk\n"
+        );
+
+        // Restore `a.txt`, then place a colliding untracked file at `new_on_other.txt`.
+        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
+        std::fs::write(dir.join("new_on_other.txt"), "local-untracked\n").unwrap();
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(repo.checkout("other").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("new_on_other.txt")).unwrap(),
+            "local-untracked\n"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_refuses_nothing_staged_and_unresolved_merge_conflict() {
+        let dir = std::env::temp_dir().join(format!("pen-git-commit-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.name", "Ada"]);
+        git(&dir, &["config", "user.email", "ada@example.com"]);
+
+        // Unborn repo with nothing staged -> error, not an empty tree commit.
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(repo.commit("empty").is_err());
+
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        git(&dir, &["add", "f.txt"]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+
+        // Clean index matching HEAD -> error, not a duplicate tree commit.
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(repo.commit("nothing staged").is_err());
+
+        // Create a real merge conflict and ensure `commit` refuses instead of deleting `f.txt`.
+        git(&dir, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.join("f.txt"), "side\n").unwrap();
+        git(&dir, &["commit", "-q", "-am", "side"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("f.txt"), "main\n").unwrap();
+        git(&dir, &["commit", "-q", "-am", "main"]);
+        let _ = std::process::Command::new("git")
+            .args(["merge", "side"])
+            .current_dir(&dir)
+            .output();
+
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(repo.commit("bad conflict commit").is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn subdirectory_discover_scopes_status_stage_diff_and_discard() {
+        let dir = std::env::temp_dir().join(format!("pen-git-subdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(dir.join("sub/Cargo.toml"), "[package]\nname = \"sub\"\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        // Modify BOTH root Cargo.toml and sub/Cargo.toml.
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\n# root edit\n").unwrap();
+        std::fs::write(
+            dir.join("sub/Cargo.toml"),
+            "[package]\nname = \"sub-edited\"\n",
+        )
+        .unwrap();
+
+        // Discovering from `dir/sub` must scope `Cargo.toml` to `sub/Cargo.toml`, never touching root!
+        let sub_repo = Repo::discover(&dir.join("sub")).unwrap().unwrap();
+        let status = sub_repo.status().unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].rel, PathBuf::from("Cargo.toml"));
+
+        let patch = sub_repo
+            .diff_worktree(std::path::Path::new("Cargo.toml"))
+            .unwrap();
+        assert!(patch.contains("sub-edited"));
+        assert!(!patch.contains("root edit"));
+
+        sub_repo
+            .discard(std::path::Path::new("Cargo.toml"))
+            .unwrap();
+        // Root Cargo.toml MUST still have its edit; only sub/Cargo.toml was discarded!
+        assert!(
+            std::fs::read_to_string(dir.join("Cargo.toml"))
+                .unwrap()
+                .contains("root edit")
+        );
+        assert!(
+            !std::fs::read_to_string(dir.join("sub/Cargo.toml"))
+                .unwrap()
+                .contains("sub-edited")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_lists_files_in_untracked_dir_and_retains_staged_files() {
+        let dir =
+            std::env::temp_dir().join(format!("pen-git-untracked-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested/deep")).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("nested/deep/new_file.rs"), "pub fn x() {}\n").unwrap();
+
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        let entries = repo.status().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rel, PathBuf::from("nested/deep/new_file.rs"));
+        assert!(!entries[0].tracked);
+
+        // Diffing and staging that nested untracked file must succeed!
+        let patch = repo.diff_worktree(&entries[0].rel).unwrap();
+        assert!(patch.contains("+pub fn x() {}"));
+        repo.stage(&entries[0].rel).unwrap();
+
+        // After staging, `status()` must STILL report the staged file until committed!
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        let after_stage = repo.status().unwrap();
+        assert_eq!(after_stage.len(), 1);
+        assert_eq!(after_stage[0].rel, PathBuf::from("nested/deep/new_file.rs"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stage_propagates_corrupt_index_instead_of_wiping_it() {
+        let dir = std::env::temp_dir().join(format!("pen-git-corrupt-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("keep.txt"), "important\n").unwrap();
+        git(&dir, &["add", "keep.txt"]);
+        std::fs::write(dir.join("other.txt"), "new\n").unwrap();
+
+        // Corrupt `.git/index` and ensure `stage` errors rather than overwriting with 1 entry.
+        std::fs::write(dir.join(".git/index"), b"CORRUPT").unwrap();
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(repo.stage(std::path::Path::new("other.txt")).is_err());
+        assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), b"CORRUPT");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_rel_rejects_symlink_with_missing_intermediate_dir() {
+        let base = std::env::temp_dir().join(format!("pen-git-sym-esc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("repo");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        git(&root, &["init", "-q"]);
+        std::os::unix::fs::symlink(&outside, root.join("link_out")).unwrap();
+
+        let repo = Repo::discover(&root).unwrap().unwrap();
+        let err = repo.discard(std::path::Path::new("link_out/missing_sub/evil.txt"));
+        assert!(matches!(err, Err(GitError::OutsideRoot(_))));
+        assert!(!outside.join("missing_sub").exists());
 
         std::fs::remove_dir_all(&base).ok();
     }

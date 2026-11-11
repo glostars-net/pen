@@ -12,7 +12,7 @@ Pen is an open-source (MIT), offline-first code editor built in Rust on
 [Rune](https://github.com/anomalyco/rune) (`wgpu` SDF rendering, Parley/Swash
 text shaping, Taffy layout — no webview, HTML, CSS, or browser engine).
 
-- **Offline-first & private.** No telemetry, ever, and no background or automatic network calls. Git operations you invoke (fetch, push, pull) connect only when you ask them to; everything else — open, edit, save, find — works fully offline.
+- **Offline-first & private.** No telemetry, ever, and no background or automatic network calls. Git operations you invoke (fetch, push, merge) connect only when you ask them to; everything else — open, edit, save, find — works fully offline.
 - **Cross-platform, all desktop architectures.** macOS (`aarch64` Apple silicon & `x86_64` Intel), Windows (`x86_64` & `aarch64`), and Linux (`x86_64` & `aarch64`).
 - **Fast on large files.** Only the visible viewport (+ 8 lines of overscan) is shaped or syntax-highlighted; keystrokes never wait on disk I/O.
 
@@ -87,8 +87,10 @@ on Windows, `~/.config/pen/theme.json` on Linux):
 }
 ```
 
-Any `accent` or `syntax` color under **4.5:1** WCAG contrast against `bg` is
-dropped automatically and replaced by the derived five-step OKLab ink ramp.
+Any `accent`, `syntax`, `added`, or `removed` color under **4.5:1** WCAG contrast
+against `bg` is dropped automatically and replaced by the derived OKLab ink
+ramp. `added` and `removed` tint the diff view; they default to two more ink
+steps when omitted.
 
 ---
 

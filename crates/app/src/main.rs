@@ -17,8 +17,8 @@ use pen::editor::{CODE_SIZE, EditorState, LINE_H, editor_view_themed};
 use pen::git_guard::{CheckoutDecision, decide_checkout};
 use pen::git_panel::{
     GitPanelState, GitSnapshot, PendingConfirm, SidebarMode, branches_section, changes_section,
-    commit_bar, confirm_bar, diff_page_view, git_dock_container, git_remote_bar, history_section,
-    status_label, worktrees_section,
+    coalesce_latest_root, commit_bar, confirm_bar, diff_page_view, git_dock_container,
+    git_remote_bar, history_section, status_label, worktrees_section,
 };
 use pen::palette::{BUILTIN_COMMANDS, filter_command_list, shortcut_hint};
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, diff_highlighter, rgb_color};
@@ -265,20 +265,25 @@ fn setup(s: &mut Pen, waker: Waker) {
                     let waker = waker.clone();
                     async move {
                         let mut last_refresh = Instant::now() - GIT_STATUS_THROTTLE;
-                        while let Some(root) = git_trigger_rx.recv().await {
-                            while git_trigger_rx.try_recv().is_ok() {}
+                        while let Some(first) = git_trigger_rx.recv().await {
+                            // Keep the newest root in a burst, not the oldest.
+                            let mut root = coalesce_latest_root(first, &mut git_trigger_rx);
                             let elapsed = last_refresh.elapsed();
                             if elapsed < GIT_STATUS_THROTTLE {
                                 tokio::time::sleep(GIT_STATUS_THROTTLE - elapsed).await;
-                                while git_trigger_rx.try_recv().is_ok() {}
+                                root = coalesce_latest_root(root, &mut git_trigger_rx);
                             }
                             let snap = tokio::task::spawn_blocking(move || {
                                 let Some(repo) = pen_git::Repo::discover(&root).ok().flatten()
                                 else {
-                                    return GitSnapshot::default();
+                                    return GitSnapshot {
+                                        root,
+                                        ..GitSnapshot::default()
+                                    };
                                 };
                                 GitSnapshot {
                                     is_repo: true,
+                                    root,
                                     current_branch: repo.current_branch().ok().flatten(),
                                     branches: repo.branches().unwrap_or_default(),
                                     entries: repo.status().unwrap_or_default(),
@@ -312,6 +317,7 @@ fn setup(s: &mut Pen, waker: Waker) {
                 }
 
                 let mut active_watcher: Option<ProjectWatcher> = None;
+                let git_cli_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 while let Some(cmd) = cmd_rx.recv().await {
                     let reply = match cmd {
                         IoCmd::OpenProject(path) => {
@@ -559,36 +565,57 @@ fn setup(s: &mut Pen, waker: Waker) {
                             fallback_note,
                             refreshes_worktree,
                         } => {
+                            if git_cli_busy
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                )
+                                .is_err()
+                            {
+                                continue;
+                            }
                             let refresh_root = project.root.clone();
-                            let reply = tokio::task::spawn_blocking(move || {
-                                let Some(cli) = pen_git::cli::GitCli::installed() else {
-                                    return IoMsg::Error("Git is not installed.".into());
-                                };
-                                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                                match cli.run(&project.root, &refs) {
-                                    Ok(msg) => {
-                                        let note = if msg.is_empty() { fallback_note } else { msg };
-                                        if refreshes_worktree {
-                                            match project.list() {
-                                                Ok(entries) => {
-                                                    IoMsg::WorktreeUpdated { note, entries }
+                            let git_tx_busy = git_trigger_tx.clone();
+                            let msg_tx_busy = msg_tx.clone();
+                            let waker_busy = waker.clone();
+                            let busy_flag = git_cli_busy.clone();
+                            tokio::spawn(async move {
+                                let reply = tokio::task::spawn_blocking(move || {
+                                    let Some(cli) = pen_git::cli::GitCli::installed() else {
+                                        return IoMsg::Error("Git is not installed.".into());
+                                    };
+                                    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                                    match cli.run(&project.root, &refs) {
+                                        Ok(msg) => {
+                                            let note =
+                                                if msg.is_empty() { fallback_note } else { msg };
+                                            if refreshes_worktree {
+                                                match project.list() {
+                                                    Ok(entries) => {
+                                                        IoMsg::WorktreeUpdated { note, entries }
+                                                    }
+                                                    Err(e) => IoMsg::Error(e.to_string()),
                                                 }
-                                                Err(e) => IoMsg::Error(e.to_string()),
+                                            } else {
+                                                IoMsg::StatusNote(note)
                                             }
-                                        } else {
-                                            IoMsg::StatusNote(note)
                                         }
+                                        Err(e) => IoMsg::Error(pen_git::cli::truncate_one_line(
+                                            &e.to_string(),
+                                            200,
+                                        )),
                                     }
-                                    Err(e) => IoMsg::Error(pen_git::cli::truncate_one_line(
-                                        &e.to_string(),
-                                        200,
-                                    )),
-                                }
-                            })
-                            .await
-                            .unwrap_or_else(|e| IoMsg::Error(e.to_string()));
-                            let _ = git_trigger_tx.try_send(refresh_root);
-                            reply
+                                })
+                                .await
+                                .unwrap_or_else(|e| IoMsg::Error(e.to_string()));
+                                busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                let _ = git_tx_busy.try_send(refresh_root);
+                                let _ = msg_tx_busy.send(reply).await;
+                                waker_busy();
+                            });
+                            continue;
                         }
                     };
                     let _ = &active_watcher;
@@ -651,7 +678,9 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
         .as_mut()
         .filter(|rx| rx.has_changed().unwrap_or(false))
         .map(|rx| rx.borrow_and_update().clone());
-    if let Some(snapshot) = git_snapshot {
+    if let Some(snapshot) = git_snapshot
+        && snapshot.matches_project(s.project.as_ref().map(|p| p.root.as_path()))
+    {
         s.git_status = snapshot;
         changed = true;
     }
@@ -719,7 +748,8 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                         let mut buf = Buffer::from_str(&src);
                         buf.mark_saved();
                         let mut ed = EditorState::from_buffer(buf).with_language(lang);
-                        ed.focused = !s.palette_open && !s.find_open;
+                        ed.focused =
+                            !s.palette_open && !s.find_open && !s.git_panel.has_active_input();
                         OpenPage::Editor(ed)
                     }
                     ReadFile::NotUtf8 => OpenPage::Notice("This file is not UTF-8.".into()),
@@ -779,17 +809,36 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                     tree.select(&sel);
                 }
                 s.files = tree;
-                if let (Some(project), Some(rel), OpenPage::Editor(ed)) =
-                    (s.project.clone(), s.active_path.clone(), &s.page)
-                    && !ed.buffer.is_dirty()
-                    && let Some(io_tx) = &s.io_tx
-                {
-                    let _ = io_tx.try_send(IoCmd::ReloadCleanFile { project, rel });
+                match (&s.page, s.active_path.clone()) {
+                    (OpenPage::Editor(ed), Some(rel)) if !ed.buffer.is_dirty() => {
+                        if s.files.contains(&path_to_slash(&rel)) {
+                            if let (Some(project), Some(io_tx)) = (s.project.clone(), &s.io_tx) {
+                                let _ = io_tx.try_send(IoCmd::ReloadCleanFile { project, rel });
+                            }
+                        } else {
+                            // The file no longer exists on this branch: close it
+                            // instead of reloading into an ENOENT error.
+                            s.active_path = None;
+                            s.page = OpenPage::Empty;
+                        }
+                    }
+                    (OpenPage::Diff { .. }, _) => {
+                        s.page = OpenPage::Empty;
+                    }
+                    _ => {}
                 }
                 s.status = Some(note);
                 tx.instant();
             }
             IoMsg::StatusNote(note) => {
+                if note.starts_with("Committed ") {
+                    s.git_panel.commit_message.clear();
+                    s.git_panel.worktree_path.clear();
+                    s.git_panel.worktree_branch.clear();
+                } else if note.starts_with("Added worktree ") {
+                    s.git_panel.worktree_path.clear();
+                    s.git_panel.worktree_branch.clear();
+                }
                 s.status = Some(note);
                 tx.instant();
             }
@@ -890,9 +939,10 @@ impl Pen {
                 branch,
             });
         }
-        self.git_panel.worktree_path.clear();
-        self.git_panel.worktree_branch.clear();
+        // Keep the typed path and branch until the add succeeds.
         self.git_panel.add_worktree_open = false;
+        self.git_panel.worktree_path.focused = false;
+        self.git_panel.worktree_branch.focused = false;
         tx.blur();
         if let OpenPage::Editor(ed) = &mut self.page {
             ed.focused = !self.find_open && !self.git_panel.commit_open;
@@ -1022,7 +1072,8 @@ impl Pen {
         if let Some(mut stashed) = self.unsaved.remove(&rel) {
             self.stash_current_if_dirty();
             self.active_path = Some(rel);
-            stashed.focused = !self.palette_open && !self.find_open;
+            stashed.focused =
+                !self.palette_open && !self.find_open && !self.git_panel.has_active_input();
             self.page = OpenPage::Editor(stashed);
             self.status = None;
             tx.instant();
@@ -1087,7 +1138,7 @@ impl Pen {
         self.palette_query.focused = false;
         tx.blur();
         if let OpenPage::Editor(ed) = &mut self.page {
-            ed.focused = !self.find_open;
+            ed.focused = !self.find_open && !self.git_panel.has_active_input();
         }
         tx.instant();
     }
@@ -1108,7 +1159,7 @@ impl Pen {
         self.find_query.focused = false;
         tx.blur();
         if let OpenPage::Editor(ed) = &mut self.page {
-            ed.focused = !self.git_panel.commit_open;
+            ed.focused = !self.find_open && !self.git_panel.has_active_input();
         }
         tx.instant();
     }
@@ -1129,7 +1180,7 @@ impl Pen {
         self.git_panel.commit_message.focused = false;
         tx.blur();
         if let OpenPage::Editor(ed) = &mut self.page {
-            ed.focused = !self.find_open;
+            ed.focused = !self.find_open && !self.git_panel.has_active_input();
         }
         tx.instant();
     }
@@ -1152,7 +1203,8 @@ impl Pen {
                 message,
             });
         }
-        self.git_panel.commit_message.clear();
+        // Keep the typed message until the commit succeeds, so a failure
+        // (missing identity, nothing staged) does not lose it.
         self.close_commit_bar(tx);
     }
 
@@ -1546,6 +1598,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                 |s: &mut Pen, tx: &mut Tx| s.toggle_add_worktree(tx),
                 |s: &mut Pen, tx: &mut Tx| s.submit_add_worktree(tx),
                 |s: &mut Pen, path: PathBuf, tx: &mut Tx| s.request_remove_worktree(path, tx),
+                s.project.as_ref().map(|p| p.root.as_path()),
             );
             git_dock_container(vec![remote, changes, branches, worktrees, history])
         }
@@ -1952,7 +2005,7 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 fn on_ime(s: &mut Pen, ime: &Ime, tx: &mut Tx) -> bool {
-    if s.palette_open || s.find_open {
+    if s.palette_open || s.find_open || s.git_panel.has_active_input() {
         return false;
     }
     if let OpenPage::Editor(ed) = &mut s.page
@@ -2087,6 +2140,7 @@ fn populate_demo_diff(s: &mut Pen, theme: &Theme) {
     s.active_path = None;
     s.git_status = GitSnapshot {
         is_repo: true,
+        root: PathBuf::from("."),
         current_branch: Some("main".into()),
         branches: vec!["main".into(), "phase-2-git".into()],
         entries: vec![

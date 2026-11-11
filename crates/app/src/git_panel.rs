@@ -66,16 +66,45 @@ pub struct GitPanelState {
     pub confirm: Option<PendingConfirm>,
 }
 
+impl GitPanelState {
+    /// True while a single-line input (commit message or add-worktree form)
+    /// owns the keyboard, so the editor must stay unfocused.
+    pub fn has_active_input(&self) -> bool {
+        self.commit_open || self.add_worktree_open
+    }
+}
+
 /// The latest known git state, or default/empty when the project isn't a git
 /// repository (or none is open yet).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitSnapshot {
     pub is_repo: bool,
+    /// Canonical project root this snapshot was computed for. `poll` ignores a
+    /// snapshot whose `root` no longer matches the open project.
+    pub root: PathBuf,
     pub current_branch: Option<String>,
     pub branches: Vec<String>,
     pub entries: Vec<pen_git::StatusEntry>,
     pub history: Vec<pen_git::CommitSummary>,
     pub worktrees: Vec<pen_git::WorktreeInfo>,
+}
+
+impl GitSnapshot {
+    pub fn matches_project(&self, project_root: Option<&std::path::Path>) -> bool {
+        project_root.is_some_and(|r| r == self.root)
+    }
+}
+
+/// Collapse a burst of project-root triggers into the newest one, so a quick
+/// folder switch never refreshes the repo the user already left.
+pub fn coalesce_latest_root(
+    mut root: PathBuf,
+    rx: &mut tokio::sync::mpsc::Receiver<PathBuf>,
+) -> PathBuf {
+    while let Ok(newer) = rx.try_recv() {
+        root = newer;
+    }
+    root
 }
 
 /// `"+2 −1"` for a modification, `"new"` for an untracked file, `""` when
@@ -622,6 +651,7 @@ pub fn worktrees_section<S: 'static>(
     on_toggle_add: impl Fn(&mut S, &mut Tx) + Clone + 'static,
     on_submit_add: impl Fn(&mut S, &mut Tx) + Clone + 'static,
     on_remove: impl Fn(&mut S, PathBuf, &mut Tx) + Clone + 'static,
+    current_root: Option<&std::path::Path>,
 ) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
@@ -793,7 +823,7 @@ pub fn worktrees_section<S: 'static>(
             )
             .child(text(wt.branch.clone()).font(UI_FONT).color(faint));
 
-        if idx > 0 {
+        if idx > 0 && wt.path != current_root.unwrap_or(std::path::Path::new("")) {
             let rm_path = wt.path.clone();
             let rm_cb = on_remove.clone();
             item = item.child(
@@ -943,5 +973,33 @@ mod tests {
             tracked: false,
         };
         assert_eq!(status_label(&e), "new");
+    }
+
+    #[test]
+    fn drain_latest_root_keeps_newest_and_panel_tracks_overlay_input() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(8);
+        tx.try_send(PathBuf::from("/old-repo")).unwrap();
+        tx.try_send(PathBuf::from("/new-folder")).unwrap();
+        let latest = coalesce_latest_root(PathBuf::from("/initial"), &mut rx);
+        assert_eq!(latest, PathBuf::from("/new-folder"));
+
+        let mut panel = GitPanelState::default();
+        assert!(!panel.has_active_input());
+        panel.commit_open = true;
+        assert!(panel.has_active_input());
+        panel.commit_open = false;
+        panel.add_worktree_open = true;
+        assert!(panel.has_active_input());
+    }
+
+    #[test]
+    fn snapshot_matches_only_current_project_root() {
+        let snap = GitSnapshot {
+            root: PathBuf::from("/repo-a"),
+            ..GitSnapshot::default()
+        };
+        assert!(snap.matches_project(Some(std::path::Path::new("/repo-a"))));
+        assert!(!snap.matches_project(Some(std::path::Path::new("/repo-b"))));
+        assert!(!snap.matches_project(None));
     }
 }
