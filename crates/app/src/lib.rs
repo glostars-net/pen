@@ -3,6 +3,7 @@
 
 pub mod disk;
 pub mod editor;
+pub mod palette;
 pub mod theme_kit;
 
 /// Bundled OFL faces (IBM Plex Sans for chrome, IBM Plex Mono for code).

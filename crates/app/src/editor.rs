@@ -10,7 +10,7 @@ use buffer::{Buffer, Preedit, apply_ime};
 use highlight::{Theme, highlight_lines};
 use rune::{
     Align, Drag, El, Family, Ime, Key, KeyEvent, OpticalSize, Phase, Span, TextStyle, Transition,
-    col, el, rich, row, text,
+    col, el, row, text,
 };
 
 use crate::theme_kit::rgb_color;
@@ -536,17 +536,19 @@ pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
             }
         }
 
-        // Code line: five-step OKLab syntax ramp over the viewport only.
+        // Code line: five-step OKLab syntax ramp over the viewport only (`text` keeps `wrap = false`).
         let line_spans = &syntax_per_line[row_pos];
-        let text_el = if line_spans.is_empty() {
-            text(expanded.clone()).font(CODE_FONT).color(fg).transition(Transition::none())
-        } else {
+        let mut text_el = text(expanded.clone())
+            .font(CODE_FONT)
+            .color(fg)
+            .transition(Transition::none());
+        if !line_spans.is_empty() {
             let spans: Vec<Span> = line_spans
                 .iter()
                 .map(|(r, rgb)| Span::new(r.start, r.end).color(rgb_color(*rgb)))
                 .collect();
-            rich(expanded.clone(), spans).font(CODE_FONT).color(fg).transition(Transition::none())
-        };
+            text_el = text_el.spans(spans);
+        }
         code_cell = code_cell.child(text_el);
 
         // Active IME preedit underline (1 px solid ink under the composition).
