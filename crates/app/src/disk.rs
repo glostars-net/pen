@@ -9,7 +9,11 @@ pub enum DiskEvent {
 /// Decides what happens when an open file changes on disk. Does not take the
 /// new bytes: the caller reads the file from disk only on [`DiskEvent::Reload`].
 pub fn on_disk_change(dirty: bool) -> DiskEvent {
-    if dirty { DiskEvent::Keep } else { DiskEvent::Reload }
+    if dirty {
+        DiskEvent::Keep
+    } else {
+        DiskEvent::Reload
+    }
 }
 
 #[cfg(test)]

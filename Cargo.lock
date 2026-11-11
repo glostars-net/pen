@@ -468,6 +468,7 @@ dependencies = [
 name = "buffer"
 version = "0.1.0"
 dependencies = [
+ "highlight",
  "ropey",
  "thiserror 2.0.21",
 ]

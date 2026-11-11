@@ -2,7 +2,7 @@
 //!
 //! Pen's default look is monochrome ink on paper: syntax is a five-step OKLab
 //! lightness ramp of `fg` toward `bg`, with every step and `faint` verified at
-//! >= 4.5:1 WCAG contrast against `bg`. A JSON theme file may supply `accent`
+//! a minimum of 4.5:1 WCAG contrast against `bg`. A JSON theme file may supply `accent`
 //! or `syntax` colors, and any entry under 4.5:1 is dropped in favor of the
 //! derived ramp.
 
@@ -143,7 +143,14 @@ pub fn load_theme(json: &str) -> Result<Theme, ThemeError> {
         }
     }
 
-    Ok(Theme { name, bg, fg, faint, selection, syntax })
+    Ok(Theme {
+        name,
+        bg,
+        fg,
+        faint,
+        selection,
+        syntax,
+    })
 }
 
 /// Highlight only the visible viewport lines through `rune_kit::syntax::highlight`
@@ -197,11 +204,9 @@ fn step_for_kind(kind: Syntax, theme: &Theme) -> Rgb {
     match kind {
         Syntax::Keyword | Syntax::Type | Syntax::Heading => theme.syntax[0],
         Syntax::Function | Syntax::Property | Syntax::Link => theme.syntax[1],
-        Syntax::String
-        | Syntax::Number
-        | Syntax::Regex
-        | Syntax::Attribute
-        | Syntax::Inserted => theme.syntax[2],
+        Syntax::String | Syntax::Number | Syntax::Regex | Syntax::Attribute | Syntax::Inserted => {
+            theme.syntax[2]
+        }
         Syntax::Operator
         | Syntax::Punctuation
         | Syntax::Parameter
@@ -228,12 +233,20 @@ fn walk_to_contrast(start: Rgb, fg: Rgb, bg: Rgb) -> Rgb {
 
 fn srgb_to_linear(u: u8) -> f32 {
     let c = f32::from(u) / 255.0;
-    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn linear_to_srgb(c: f32) -> u8 {
     let c = c.clamp(0.0, 1.0);
-    let s = if c <= 0.003_130_8 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    let s = if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
     (s * 255.0).round() as u8
 }
 
@@ -254,7 +267,11 @@ fn mix_oklab(a: Rgb, b: Rgb, t: f32) -> Rgb {
 }
 
 fn rgb_to_oklab(c: Rgb) -> [f32; 3] {
-    let (r, g, b) = (srgb_to_linear(c.0), srgb_to_linear(c.1), srgb_to_linear(c.2));
+    let (r, g, b) = (
+        srgb_to_linear(c.0),
+        srgb_to_linear(c.1),
+        srgb_to_linear(c.2),
+    );
     let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
     let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
     let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
@@ -282,7 +299,10 @@ mod tests {
 
     #[test]
     fn paper_and_ink_text_clear_contrast() {
-        for raw in [include_str!("../themes/paper.json"), include_str!("../themes/ink.json")] {
+        for raw in [
+            include_str!("../themes/paper.json"),
+            include_str!("../themes/ink.json"),
+        ] {
             let t = load_theme(raw).unwrap();
             assert!(contrast_ratio(t.fg, t.bg) >= 4.5);
             assert!(contrast_ratio(t.faint, t.bg) >= 4.5);
@@ -301,10 +321,17 @@ mod tests {
 
     #[test]
     fn highlight_lines_colors_rust_viewport() {
-        let lines = vec!["fn main() {".to_owned(), "    // note".to_owned(), "}".to_owned()];
+        let lines = vec![
+            "fn main() {".to_owned(),
+            "    // note".to_owned(),
+            "}".to_owned(),
+        ];
         let spans = highlight_lines(Some("rust"), &lines, &ink());
         assert_eq!(spans.len(), 3);
-        assert!(!spans[0].is_empty(), "expected `fn` / `main` tokens on line 0");
+        assert!(
+            !spans[0].is_empty(),
+            "expected `fn` / `main` tokens on line 0"
+        );
         assert!(!spans[1].is_empty(), "expected comment token on line 1");
     }
 }

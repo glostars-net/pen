@@ -51,7 +51,11 @@ impl ThemePref {
     fn resolve(&self, system_dark: bool) -> Theme {
         match self {
             ThemePref::System => {
-                if system_dark { highlight::ink() } else { highlight::paper() }
+                if system_dark {
+                    highlight::ink()
+                } else {
+                    highlight::paper()
+                }
             }
             ThemePref::Ink => highlight::ink(),
             ThemePref::Paper => highlight::paper(),
@@ -64,24 +68,47 @@ impl ThemePref {
 enum IoCmd {
     OpenProject(PathBuf),
     RefreshTree(Project),
-    ReadFile { project: Project, rel: PathBuf },
-    ReloadCleanFile { project: Project, rel: PathBuf },
-    SaveFile { project: Project, rel: PathBuf, bytes: Vec<u8> },
+    ReadFile {
+        project: Project,
+        rel: PathBuf,
+    },
+    ReloadCleanFile {
+        project: Project,
+        rel: PathBuf,
+    },
+    SaveFile {
+        project: Project,
+        rel: PathBuf,
+        bytes: Vec<u8>,
+    },
     SaveThemePref(&'static str),
 }
 
 /// Answers sent back from the Tokio disk worker to `poll`.
 enum IoMsg {
-    PrefsLoaded { theme_pref: ThemePref, first_launch: bool },
+    PrefsLoaded {
+        theme_pref: ThemePref,
+        first_launch: bool,
+    },
     ProjectListed {
         project: Project,
         entries: Vec<FileEntry>,
         watch_rx: Option<watch::Receiver<Option<WatchEvent>>>,
     },
-    TreeRefreshed { entries: Vec<FileEntry> },
-    FileRead { rel: PathBuf, result: ReadFile },
-    FileReloaded { rel: PathBuf, result: ReadFile },
-    FileSaved { rel: PathBuf },
+    TreeRefreshed {
+        entries: Vec<FileEntry>,
+    },
+    FileRead {
+        rel: PathBuf,
+        result: ReadFile,
+    },
+    FileReloaded {
+        rel: PathBuf,
+        result: ReadFile,
+    },
+    FileSaved {
+        rel: PathBuf,
+    },
     Error(String),
 }
 
@@ -140,9 +167,7 @@ fn setup(s: &mut Pen, waker: Waker) {
     let headless = rune::is_headless();
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<IoCmd>(32);
     let (msg_tx, msg_rx) = mpsc::channel::<IoMsg>(32);
-    if !headless
-        && let Some(arg) = rune::extra_args().into_iter().find(|a| !a.starts_with('-'))
-    {
+    if !headless && let Some(arg) = rune::extra_args().iter().find(|a| !a.starts_with('-')) {
         let _ = cmd_tx.try_send(IoCmd::OpenProject(PathBuf::from(arg)));
     }
     std::thread::Builder::new()
@@ -161,7 +186,12 @@ fn setup(s: &mut Pen, waker: Waker) {
                         tokio::task::spawn_blocking(read_startup_prefs_blocking)
                             .await
                             .unwrap_or((ThemePref::System, false));
-                    let _ = msg_tx.send(IoMsg::PrefsLoaded { theme_pref, first_launch }).await;
+                    let _ = msg_tx
+                        .send(IoMsg::PrefsLoaded {
+                            theme_pref,
+                            first_launch,
+                        })
+                        .await;
                     waker();
                 }
 
@@ -188,7 +218,11 @@ fn setup(s: &mut Pen, waker: Waker) {
                                         }
                                         Err(_) => None,
                                     };
-                                    IoMsg::ProjectListed { project, entries, watch_rx }
+                                    IoMsg::ProjectListed {
+                                        project,
+                                        entries,
+                                        watch_rx,
+                                    }
                                 }
                                 Err(e) => IoMsg::Error(e),
                             }
@@ -198,7 +232,9 @@ fn setup(s: &mut Pen, waker: Waker) {
                                 .await
                                 .map_err(|e| e.to_string())
                                 .and_then(|r| r.map_err(|e| e.to_string()))
-                                .map_or_else(IoMsg::Error, |entries| IoMsg::TreeRefreshed { entries })
+                                .map_or_else(IoMsg::Error, |entries| IoMsg::TreeRefreshed {
+                                    entries,
+                                })
                         }
                         IoCmd::ReadFile { project, rel } => {
                             tokio::task::spawn_blocking(move || {
@@ -208,9 +244,10 @@ fn setup(s: &mut Pen, waker: Waker) {
                             .await
                             .map_err(|e| e.to_string())
                             .and_then(|r| r.map_err(|e| e.to_string()))
-                            .map_or_else(IoMsg::Error, |(rel, result)| {
-                                IoMsg::FileRead { rel, result }
-                            })
+                            .map_or_else(
+                                IoMsg::Error,
+                                |(rel, result)| IoMsg::FileRead { rel, result },
+                            )
                         }
                         IoCmd::ReloadCleanFile { project, rel } => {
                             tokio::task::spawn_blocking(move || {
@@ -220,20 +257,23 @@ fn setup(s: &mut Pen, waker: Waker) {
                             .await
                             .map_err(|e| e.to_string())
                             .and_then(|r| r.map_err(|e| e.to_string()))
-                            .map_or_else(IoMsg::Error, |(rel, result)| {
-                                IoMsg::FileReloaded { rel, result }
-                            })
+                            .map_or_else(
+                                IoMsg::Error,
+                                |(rel, result)| IoMsg::FileReloaded { rel, result },
+                            )
                         }
-                        IoCmd::SaveFile { project, rel, bytes } => {
-                            tokio::task::spawn_blocking(move || {
-                                project.write_atomic(&rel, &bytes)?;
-                                Ok::<_, project::ProjectError>(rel)
-                            })
-                            .await
-                            .map_err(|e| e.to_string())
-                            .and_then(|r| r.map_err(|e| e.to_string()))
-                            .map_or_else(IoMsg::Error, |rel| IoMsg::FileSaved { rel })
-                        }
+                        IoCmd::SaveFile {
+                            project,
+                            rel,
+                            bytes,
+                        } => tokio::task::spawn_blocking(move || {
+                            project.write_atomic(&rel, &bytes)?;
+                            Ok::<_, project::ProjectError>(rel)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r.map_err(|e| e.to_string()))
+                        .map_or_else(IoMsg::Error, |rel| IoMsg::FileSaved { rel }),
                         IoCmd::SaveThemePref(choice) => {
                             let _ = tokio::task::spawn_blocking(move || {
                                 write_theme_pref_blocking(choice)
@@ -280,7 +320,10 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 }
                 DiskEvent::Reload => {
                     if let (Some(project), Some(io_tx)) = (s.project.clone(), &s.io_tx) {
-                        let _ = io_tx.try_send(IoCmd::ReloadCleanFile { project, rel: rel.clone() });
+                        let _ = io_tx.try_send(IoCmd::ReloadCleanFile {
+                            project,
+                            rel: rel.clone(),
+                        });
                     }
                 }
             }
@@ -304,7 +347,10 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
     }
     for msg in batch {
         match msg {
-            IoMsg::PrefsLoaded { theme_pref, first_launch } => {
+            IoMsg::PrefsLoaded {
+                theme_pref,
+                first_launch,
+            } => {
                 s.theme_pref = theme_pref;
                 if first_launch && s.project.is_none() {
                     s.page_opacity = 0.0;
@@ -315,7 +361,11 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                     tx.instant();
                 }
             }
-            IoMsg::ProjectListed { project, entries, watch_rx } => {
+            IoMsg::ProjectListed {
+                project,
+                entries,
+                watch_rx,
+            } => {
                 s.files = build_file_tree(entries);
                 s.project = Some(project);
                 s.watch_rx = watch_rx;
@@ -402,7 +452,9 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
 
 impl Pen {
     fn stash_current_if_dirty(&mut self) {
-        let Some(prev) = self.active_path.take() else { return };
+        let Some(prev) = self.active_path.take() else {
+            return;
+        };
         if let OpenPage::Editor(ed) = std::mem::replace(&mut self.page, OpenPage::Empty)
             && ed.buffer.is_dirty()
         {
@@ -411,7 +463,9 @@ impl Pen {
     }
 
     fn request_open_file(&mut self, id: &str, tx: &mut Tx) {
-        let Some(rel) = self.files.get(id).and_then(|n| n.data.clone()) else { return };
+        let Some(rel) = self.files.get(id).and_then(|n| n.data.clone()) else {
+            return;
+        };
         if self.active_path.as_ref() == Some(&rel) {
             return;
         }
@@ -424,7 +478,9 @@ impl Pen {
             tx.instant();
             return;
         }
-        let (Some(project), Some(io_tx)) = (self.project.clone(), &self.io_tx) else { return };
+        let (Some(project), Some(io_tx)) = (self.project.clone(), &self.io_tx) else {
+            return;
+        };
         let _ = io_tx.try_send(IoCmd::ReadFile { project, rel });
     }
 
@@ -434,7 +490,9 @@ impl Pen {
         else {
             return false;
         };
-        let OpenPage::Editor(ed) = &self.page else { return false };
+        let OpenPage::Editor(ed) = &self.page else {
+            return false;
+        };
         let _ = io_tx.try_send(IoCmd::SaveFile {
             project,
             rel,
@@ -557,7 +615,9 @@ fn tree_label(n: &FileNode<PathBuf>) -> &str {
 /// `theme.json`) and the one-shot `launched` marker for the 200ms first-launch
 /// page fade.
 fn read_startup_prefs_blocking() -> (ThemePref, bool) {
-    let Some(dirs) = AppDirs::new("pen") else { return (ThemePref::System, false) };
+    let Some(dirs) = AppDirs::new("pen") else {
+        return (ThemePref::System, false);
+    };
     let cfg = dirs.config();
     let launched_file = cfg.join("launched");
     let first_launch = !launched_file.exists();
@@ -572,7 +632,11 @@ fn read_startup_prefs_blocking() -> (ThemePref, bool) {
         return (ThemePref::Custom(Box::new(theme)), first_launch);
     }
     let choice_path = cfg.join("theme");
-    let pref = match std::fs::read_to_string(choice_path).ok().as_deref().map(str::trim) {
+    let pref = match std::fs::read_to_string(choice_path)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
         Some("ink") => ThemePref::Ink,
         Some("paper") => ThemePref::Paper,
         _ => ThemePref::System,
@@ -581,7 +645,9 @@ fn read_startup_prefs_blocking() -> (ThemePref, bool) {
 }
 
 fn write_theme_pref_blocking(choice: &str) {
-    let Some(dirs) = AppDirs::new("pen") else { return };
+    let Some(dirs) = AppDirs::new("pen") else {
+        return;
+    };
     if std::fs::create_dir_all(dirs.config()).is_err() {
         return;
     }
@@ -656,13 +722,17 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
             path_to_slash(rel)
         };
         toolbar = toolbar.trailing(
-            text(label).key("pen/active-file").font(UI_FONT).color(faint).transition(Transition::none()),
+            text(label)
+                .key("pen/active-file")
+                .font(UI_FONT)
+                .color(faint)
+                .transition(Transition::none()),
         );
     }
 
     let tree = Tree::new(|s: &Pen| &s.files, |s: &mut Pen| &mut s.files, tree_label)
         .name("Files")
-        .row(|n, r| TreeItem::file(n, r))
+        .row(TreeItem::file)
         .on_select(|s: &mut Pen, id: &str, tx: &mut Tx| s.request_open_file(id, tx))
         .on_open(|s: &mut Pen, id: &str, tx: &mut Tx| s.request_open_file(id, tx))
         .build(s, &k)
@@ -792,7 +862,11 @@ fn palette_overlay(s: &Pen, theme: &Theme) -> El {
     let rule = fg.alpha(0.20);
 
     let hits = filter_commands(&s.palette_query.text, BUILTIN_COMMANDS);
-    let selected = if hits.is_empty() { 0 } else { s.palette_index.min(hits.len() - 1) };
+    let selected = if hits.is_empty() {
+        0
+    } else {
+        s.palette_index.min(hits.len() - 1)
+    };
 
     let input = text_input(&s.palette_query, UI_FONT)
         .key("pen/palette-input")
@@ -824,16 +898,13 @@ fn palette_overlay(s: &Pen, theme: &Theme) -> El {
                 }
                 Key::Up => {
                     if !hits.is_empty() {
-                        s.palette_index =
-                            s.palette_index.checked_sub(1).unwrap_or(hits.len() - 1);
+                        s.palette_index = s.palette_index.checked_sub(1).unwrap_or(hits.len() - 1);
                         tx.instant();
                     }
                     true
                 }
                 Key::Enter => {
-                    if let Some(cmd) =
-                        hits.get(s.palette_index.min(hits.len().saturating_sub(1)))
-                    {
+                    if let Some(cmd) = hits.get(s.palette_index.min(hits.len().saturating_sub(1))) {
                         let cmd = cmd.clone();
                         s.run_command(&cmd, tx);
                     }
@@ -843,7 +914,12 @@ fn palette_overlay(s: &Pen, theme: &Theme) -> El {
             }
         });
 
-    let mut list = col().key("pen/palette-list").w_full().px(6.0).py(6.0).gap(2.0);
+    let mut list = col()
+        .key("pen/palette-list")
+        .w_full()
+        .px(6.0)
+        .py(6.0)
+        .gap(2.0);
     for (idx, cmd) in hits.iter().enumerate() {
         let active = idx == selected;
         let cmd_owned = cmd.clone();
@@ -900,8 +976,7 @@ fn palette_overlay(s: &Pen, theme: &Theme) -> El {
     } else {
         fg.alpha(0.10)
     };
-    el()
-        .key("pen/palette-backdrop")
+    el().key("pen/palette-backdrop")
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
@@ -1022,8 +1097,10 @@ fn on_ime(s: &mut Pen, ime: &Ime, tx: &mut Tx) -> bool {
     false
 }
 
+type SceneFn = fn(&mut Pen);
+
 /// Named scenes for headless design inspection (`--snap ... --scene <name>`).
-const SCENES: &[(&str, fn(&mut Pen))] = &[
+const SCENES: &[(&str, SceneFn)] = &[
     ("empty-paper", |s| {
         s.theme_pref = ThemePref::Paper;
     }),
@@ -1083,15 +1160,32 @@ impl Document {
     let mut ed = EditorState::from_buffer(buf).with_language(Some("rust"));
     ed.caret = 92;
     ed.anchor = 92;
-    s.project = Some(Project { root: PathBuf::from(".") });
+    s.project = Some(Project {
+        root: PathBuf::from("."),
+    });
     s.files = FileTree::new().key("pen/tree").build([
         ("Cargo.toml", PathBuf::from("Cargo.toml")),
         ("README.md", PathBuf::from("README.md")),
-        ("crates/app/src/main.rs", PathBuf::from("crates/app/src/main.rs")),
-        ("crates/app/src/editor.rs", PathBuf::from("crates/app/src/editor.rs")),
-        ("crates/buffer/src/lib.rs", PathBuf::from("crates/buffer/src/lib.rs")),
-        ("crates/highlight/src/lib.rs", PathBuf::from("crates/highlight/src/lib.rs")),
-        ("crates/project/src/lib.rs", PathBuf::from("crates/project/src/lib.rs")),
+        (
+            "crates/app/src/main.rs",
+            PathBuf::from("crates/app/src/main.rs"),
+        ),
+        (
+            "crates/app/src/editor.rs",
+            PathBuf::from("crates/app/src/editor.rs"),
+        ),
+        (
+            "crates/buffer/src/lib.rs",
+            PathBuf::from("crates/buffer/src/lib.rs"),
+        ),
+        (
+            "crates/highlight/src/lib.rs",
+            PathBuf::from("crates/highlight/src/lib.rs"),
+        ),
+        (
+            "crates/project/src/lib.rs",
+            PathBuf::from("crates/project/src/lib.rs"),
+        ),
     ]);
     s.files.expand_all();
     s.files.select("crates/app/src/editor.rs");

@@ -9,5 +9,8 @@ description = "Pen's rope text buffer: edits, undo, viewport slices, IME commit 
 ropey.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+highlight = { path = "../highlight" }
+
 [lints]
 workspace = true

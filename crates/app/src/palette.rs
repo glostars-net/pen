@@ -2,13 +2,7 @@
 //! built-in commands. Opens and dismisses with zero animation.
 
 /// The five phase-1 built-in commands, in sentence case (Task 10).
-pub const BUILTIN_COMMANDS: &[&str] = &[
-    "Open folder",
-    "Save",
-    "Find",
-    "Use Ink",
-    "Use Paper",
-];
+pub const BUILTIN_COMMANDS: &[&str] = &["Open folder", "Save", "Find", "Use Ink", "Use Paper"];
 
 /// Case-insensitive substring filter over `commands`, preserving order.
 pub fn filter_commands(query: &str, commands: &[&str]) -> Vec<String> {
@@ -23,9 +17,21 @@ pub fn filter_commands(query: &str, commands: &[&str]) -> Vec<String> {
 /// Platform shortcut label shown beside a built-in command in the palette.
 pub fn shortcut_hint(command: &str) -> Option<&'static str> {
     match command {
-        "Open folder" => Some(if cfg!(target_os = "macos") { "⌘O" } else { "Ctrl+O" }),
-        "Save" => Some(if cfg!(target_os = "macos") { "⌘S" } else { "Ctrl+S" }),
-        "Find" => Some(if cfg!(target_os = "macos") { "⌘F" } else { "Ctrl+F" }),
+        "Open folder" => Some(if cfg!(target_os = "macos") {
+            "⌘O"
+        } else {
+            "Ctrl+O"
+        }),
+        "Save" => Some(if cfg!(target_os = "macos") {
+            "⌘S"
+        } else {
+            "Ctrl+S"
+        }),
+        "Find" => Some(if cfg!(target_os = "macos") {
+            "⌘F"
+        } else {
+            "Ctrl+F"
+        }),
         _ => None,
     }
 }

@@ -52,7 +52,10 @@ pub fn watch_project_with(
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
         // Ignore pure reads (`inotify` Access on Linux would otherwise loop on `Project::read`).
-        if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)) {
+        if !matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ) {
             return;
         }
         for path in event.paths {
@@ -83,7 +86,8 @@ pub fn watch_project_with(
                     let now = Instant::now();
                     let ready: Vec<PathBuf> = pending
                         .iter()
-                        .filter_map(|(p, &due)| (due <= now).then(|| p.clone()))
+                        .filter(|(_, due)| **due <= now)
+                        .map(|(p, _)| p.clone())
                         .collect();
                     for rel in ready {
                         pending.remove(&rel);
@@ -97,7 +101,13 @@ pub fn watch_project_with(
         }
     });
 
-    Ok((ProjectWatcher { _watcher: watcher, task }, pub_rx))
+    Ok((
+        ProjectWatcher {
+            _watcher: watcher,
+            task,
+        },
+        pub_rx,
+    ))
 }
 
 fn relativize_inside(root: &Path, path: &Path) -> Option<PathBuf> {
@@ -109,7 +119,11 @@ fn relativize_inside(root: &Path, path: &Path) -> Option<PathBuf> {
             let parent = path.parent()?;
             let name = path.file_name()?;
             let canon_parent = std::fs::canonicalize(parent).ok()?;
-            canon_parent.join(name).strip_prefix(root).ok().map(Path::to_path_buf)
+            canon_parent
+                .join(name)
+                .strip_prefix(root)
+                .ok()
+                .map(Path::to_path_buf)
         })?;
     if rel.as_os_str().is_empty() {
         return None;
@@ -168,7 +182,11 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, WatchEvent::Changed(p) if p.ends_with("note.rs")))
             .collect();
-        assert_eq!(hits.len(), 1, "expected 1 debounced Changed for note.rs, got {seen:?}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected 1 debounced Changed for note.rs, got {seen:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

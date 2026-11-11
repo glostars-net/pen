@@ -88,7 +88,10 @@ pub fn build_kit(theme: &Theme) -> Kit {
     // 13px IBM Plex Sans across UI labels.
     k.ty.ui = UI_FONT;
     k.ty.ui_medium = UI_MEDIUM_FONT;
-    k.ty.ui_compact = TextStyle { line_height: 18.0, ..UI_FONT };
+    k.ty.ui_compact = TextStyle {
+        line_height: 18.0,
+        ..UI_FONT
+    };
     k.ty.body = UI_FONT;
     k.ty.body_medium = UI_MEDIUM_FONT;
     k.ty.text_small = UI_FONT;

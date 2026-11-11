@@ -52,8 +52,10 @@ impl Project {
     /// `..` escape checks compare real paths on every OS.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ProjectError> {
         let raw = root.into();
-        let canon = std::fs::canonicalize(&raw)
-            .map_err(|source| ProjectError::Open { path: raw.clone(), source })?;
+        let canon = std::fs::canonicalize(&raw).map_err(|source| ProjectError::Open {
+            path: raw.clone(),
+            source,
+        })?;
         if !canon.is_dir() {
             return Err(ProjectError::NotADirectory { path: canon });
         }
@@ -84,18 +86,26 @@ impl Project {
                     _ => continue,
                 }
             }
-            let Ok(rel) = path.strip_prefix(&self.root) else { continue };
+            let Ok(rel) = path.strip_prefix(&self.root) else {
+                continue;
+            };
             if rel.as_os_str().is_empty() {
                 continue;
             }
             let is_dir = dent.file_type().is_some_and(|ft| ft.is_dir());
-            entries.push(FileEntry { rel: rel.to_path_buf(), is_dir });
+            entries.push(FileEntry {
+                rel: rel.to_path_buf(),
+                is_dir,
+            });
         }
 
         entries.sort_by(|a, b| {
-            (!a.is_dir)
-                .cmp(&(!b.is_dir))
-                .then_with(|| a.rel.as_os_str().as_encoded_bytes().cmp(b.rel.as_os_str().as_encoded_bytes()))
+            (!a.is_dir).cmp(&(!b.is_dir)).then_with(|| {
+                a.rel
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .cmp(b.rel.as_os_str().as_encoded_bytes())
+            })
         });
         Ok(entries)
     }
@@ -105,13 +115,19 @@ impl Project {
     /// rather than a lossy decode.
     pub fn read(&self, rel: &Path) -> Result<ReadFile, ProjectError> {
         let joined = self.checked_join(rel)?;
-        let canon = std::fs::canonicalize(&joined)
-            .map_err(|source| ProjectError::Io { path: joined.clone(), source })?;
+        let canon = std::fs::canonicalize(&joined).map_err(|source| ProjectError::Io {
+            path: joined.clone(),
+            source,
+        })?;
         if !canon.starts_with(&self.root) {
-            return Err(ProjectError::OutsideRoot { path: rel.to_path_buf() });
+            return Err(ProjectError::OutsideRoot {
+                path: rel.to_path_buf(),
+            });
         }
-        let bytes = std::fs::read(&canon)
-            .map_err(|source| ProjectError::Io { path: canon, source })?;
+        let bytes = std::fs::read(&canon).map_err(|source| ProjectError::Io {
+            path: canon,
+            source,
+        })?;
         Ok(match String::from_utf8(bytes) {
             Ok(s) => ReadFile::Utf8(s),
             Err(_) => ReadFile::NotUtf8,
@@ -123,28 +139,37 @@ impl Project {
     /// is untouched.
     pub fn write_atomic(&self, rel: &Path, bytes: &[u8]) -> Result<(), ProjectError> {
         let target = self.checked_join(rel)?;
-        let parent = target
-            .parent()
-            .ok_or_else(|| ProjectError::OutsideRoot { path: rel.to_path_buf() })?;
-        let canon_parent = std::fs::canonicalize(parent)
-            .map_err(|source| ProjectError::Io { path: parent.to_path_buf(), source })?;
+        let parent = target.parent().ok_or_else(|| ProjectError::OutsideRoot {
+            path: rel.to_path_buf(),
+        })?;
+        let canon_parent = std::fs::canonicalize(parent).map_err(|source| ProjectError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
         if !canon_parent.starts_with(&self.root) {
-            return Err(ProjectError::OutsideRoot { path: rel.to_path_buf() });
+            return Err(ProjectError::OutsideRoot {
+                path: rel.to_path_buf(),
+            });
         }
         // If the target already exists as a symlink, ensure it stays inside `root`.
         if let Ok(meta) = std::fs::symlink_metadata(&target)
             && meta.file_type().is_symlink()
         {
-            let dest = std::fs::canonicalize(&target)
-                .map_err(|source| ProjectError::Io { path: target.clone(), source })?;
+            let dest = std::fs::canonicalize(&target).map_err(|source| ProjectError::Io {
+                path: target.clone(),
+                source,
+            })?;
             if !dest.starts_with(&self.root) {
-                return Err(ProjectError::OutsideRoot { path: rel.to_path_buf() });
+                return Err(ProjectError::OutsideRoot {
+                    path: rel.to_path_buf(),
+                });
             }
         }
-        let name = target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| ProjectError::OutsideRoot { path: rel.to_path_buf() })?;
+        let name = target.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            ProjectError::OutsideRoot {
+                path: rel.to_path_buf(),
+            }
+        })?;
         let tmp = canon_parent.join(format!(".{name}.pen-tmp"));
         let final_target = canon_parent.join(name);
 
@@ -160,20 +185,27 @@ impl Project {
         }
         if let Err(source) = std::fs::rename(&tmp, &final_target) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(ProjectError::Io { path: final_target, source });
+            return Err(ProjectError::Io {
+                path: final_target,
+                source,
+            });
         }
         Ok(())
     }
 
     fn checked_join(&self, rel: &Path) -> Result<PathBuf, ProjectError> {
         if rel.as_os_str().is_empty() || rel.is_absolute() {
-            return Err(ProjectError::OutsideRoot { path: rel.to_path_buf() });
+            return Err(ProjectError::OutsideRoot {
+                path: rel.to_path_buf(),
+            });
         }
         for comp in rel.components() {
             match comp {
                 Component::Normal(_) | Component::CurDir => {}
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Err(ProjectError::OutsideRoot { path: rel.to_path_buf() });
+                    return Err(ProjectError::OutsideRoot {
+                        path: rel.to_path_buf(),
+                    });
                 }
             }
         }
@@ -202,7 +234,11 @@ mod tests {
         assert!(rels.iter().any(|p| p.ends_with("keep.rs")));
         assert!(rels.iter().any(|p| p.ends_with("a.rs")));
         assert!(!rels.iter().any(|p| p.ends_with("skip.log")));
-        assert!(!rels.iter().any(|p| p.components().any(|c| c.as_os_str() == ".git")));
+        assert!(
+            !rels
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == ".git"))
+        );
         // Directories precede files.
         let first_file = entries.iter().position(|e| !e.is_dir).unwrap();
         assert!(entries[..first_file].iter().all(|e| e.is_dir));
@@ -232,7 +268,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pen-proj-escape-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let err = Project::open(&root).unwrap().read(std::path::Path::new("../outside"));
+        let err = Project::open(&root)
+            .unwrap()
+            .read(std::path::Path::new("../outside"));
         assert!(err.is_err());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -244,7 +282,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("bad.bin"), [0xff, 0xfe]).unwrap();
         let project = Project::open(&root).unwrap();
-        assert!(matches!(project.read(std::path::Path::new("bad.bin")).unwrap(), ReadFile::NotUtf8));
+        assert!(matches!(
+            project.read(std::path::Path::new("bad.bin")).unwrap(),
+            ReadFile::NotUtf8
+        ));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -261,8 +302,16 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("escape.txt")).unwrap();
 
         let entries = Project::open(&root).unwrap().list().unwrap();
-        assert!(!entries.iter().any(|e| e.rel == std::path::Path::new("escape.txt")));
-        assert!(entries.iter().any(|e| e.rel == std::path::Path::new("ok.rs")));
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.rel == std::path::Path::new("escape.txt"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.rel == std::path::Path::new("ok.rs"))
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }

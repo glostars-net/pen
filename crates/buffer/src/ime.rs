@@ -42,14 +42,20 @@ pub fn apply_ime(
         None => buffer.len_chars(),
     };
     if start > buffer.len_chars() {
-        return Err(ImeError::OutOfBounds { start, len: buffer.len_chars() });
+        return Err(ImeError::OutOfBounds {
+            start,
+            len: buffer.len_chars(),
+        });
     }
     if commit {
         // One normal edit: dirty, one undo entry.
         buffer.insert(start, replacement);
     } else if !replacement.is_empty() {
         buffer.replace_silent(start..start, replacement);
-        *preedit = Some(Preedit { start, text: replacement.to_owned() });
+        *preedit = Some(Preedit {
+            start,
+            text: replacement.to_owned(),
+        });
         buffer.set_dirty(was_dirty);
     } else {
         // Cancelled: the rope is back to its pre-composition text.

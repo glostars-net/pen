@@ -41,21 +41,36 @@ pub struct Buffer {
 impl Buffer {
     #[allow(clippy::should_implement_trait)] // the plan's constructor name; not `FromStr`, which parses
     pub fn from_str(text: &str) -> Self {
-        Buffer { rope: ropey::Rope::from_str(text), undo: VecDeque::new(), redo: Vec::new(), dirty: false }
+        Buffer {
+            rope: ropey::Rope::from_str(text),
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            dirty: false,
+        }
     }
 
     /// Read a whole file. Clean (not dirty), empty undo. UTF-8 only: bytes
     /// that aren't valid UTF-8 are an error, as are read failures.
     pub fn from_reader(reader: impl std::io::Read) -> Result<Self, std::io::Error> {
         let rope = ropey::Rope::from_reader(reader)?;
-        Ok(Buffer { rope, undo: VecDeque::new(), redo: Vec::new(), dirty: false })
+        Ok(Buffer {
+            rope,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            dirty: false,
+        })
     }
 
     /// At most `count` lines starting at `first_line`, fewer at end of file.
     /// Walks only the requested range; it never shapes or copies the file.
     pub fn viewport(&self, first_line: usize, count: usize) -> Vec<LineSlice> {
         let end = (first_line + count).min(self.len_lines());
-        (first_line..end).map(|line_idx| LineSlice { line_idx, text: self.line(line_idx) }).collect()
+        (first_line..end)
+            .map(|line_idx| LineSlice {
+                line_idx,
+                text: self.line(line_idx),
+            })
+            .collect()
     }
 
     /// Insert `text` at a char index. Pushes one undo entry and clears redo.
@@ -64,7 +79,10 @@ impl Buffer {
             return;
         }
         self.rope.insert(char_idx, text);
-        self.push_undo(Edit::Delete { at: char_idx, len: text.chars().count() });
+        self.push_undo(Edit::Delete {
+            at: char_idx,
+            len: text.chars().count(),
+        });
         self.redo.clear();
         self.dirty = true;
     }
@@ -76,14 +94,19 @@ impl Buffer {
         }
         let removed: String = self.rope.slice(range.clone()).into();
         self.rope.remove(range.clone());
-        self.push_undo(Edit::Insert { at: range.start, text: removed });
+        self.push_undo(Edit::Insert {
+            at: range.start,
+            text: removed,
+        });
         self.redo.clear();
         self.dirty = true;
     }
 
     /// Apply the newest undo entry. False when there is nothing to undo.
     pub fn undo(&mut self) -> bool {
-        let Some(edit) = self.undo.pop_back() else { return false };
+        let Some(edit) = self.undo.pop_back() else {
+            return false;
+        };
         let inverse = self.apply(edit);
         self.redo.push(inverse);
         self.dirty = true;
@@ -92,7 +115,9 @@ impl Buffer {
 
     /// Re-apply the newest undone edit. False when there is nothing to redo.
     pub fn redo(&mut self) -> bool {
-        let Some(edit) = self.redo.pop() else { return false };
+        let Some(edit) = self.redo.pop() else {
+            return false;
+        };
         let inverse = self.apply(edit);
         self.undo.push_back(inverse);
         self.dirty = true;
@@ -126,7 +151,11 @@ impl Buffer {
         let slice = self.rope.line(line_idx);
         let n = slice.len_chars();
         if n > 0 && slice.char(n - 1) == '\n' {
-            if n > 1 && slice.char(n - 2) == '\r' { n - 2 } else { n - 1 }
+            if n > 1 && slice.char(n - 2) == '\r' {
+                n - 2
+            } else {
+                n - 1
+            }
         } else {
             n
         }
@@ -186,7 +215,10 @@ impl Buffer {
         match edit {
             Edit::Insert { at, text } => {
                 self.rope.insert(at, &text);
-                Edit::Delete { at, len: text.chars().count() }
+                Edit::Delete {
+                    at,
+                    len: text.chars().count(),
+                }
             }
             Edit::Delete { at, len } => {
                 let removed: String = self.rope.slice(at..at + len).into();
@@ -284,7 +316,46 @@ mod tests {
         let b = Buffer::from_reader(raw.as_bytes()).unwrap();
         let took = start.elapsed();
         println!("10 MB from_reader: {took:?} ({} lines)", b.len_lines());
-        assert!(took.as_millis() < 100, "10 MB open took {took:?}, budget is 100 ms");
+        assert!(
+            took.as_millis() < 100,
+            "10 MB open took {took:?}, budget is 100 ms"
+        );
+    }
+
+    /// Task 11 keystroke budget: inserting one char into the middle of a 10 MB
+    /// rope, slicing a 40-line viewport, and syntax-highlighting those 40 lines
+    /// finishes in under 2 ms in release.
+    #[test]
+    #[ignore = "release-only budget test"]
+    fn keystroke_viewport_and_highlight_on_10mb_is_under_2ms() {
+        let line = "pub fn compute(input: usize, factor: usize) -> usize { input * factor + 1 }\n";
+        let mut raw = String::with_capacity(10 * 1024 * 1024 + line.len());
+        while raw.len() < 10 * 1024 * 1024 {
+            raw.push_str(line);
+        }
+        let mut b = Buffer::from_reader(raw.as_bytes()).unwrap();
+        let theme = highlight::ink();
+        // Warm the static lexer lookup table once (as opening the file already does).
+        let _ = highlight::highlight_lines(Some("rust"), &["fn warm() {}".to_owned()], &theme);
+
+        let mid_line = b.len_lines() / 2;
+        let mid_char = b.line_to_char(mid_line) + 12;
+
+        let start = std::time::Instant::now();
+        b.insert(mid_char, "x");
+        let vp = b.viewport(mid_line, 40);
+        let lines: Vec<String> = vp.into_iter().map(|s| s.text).collect();
+        let spans = highlight::highlight_lines(Some("rust"), &lines, &theme);
+        let took = start.elapsed();
+
+        println!(
+            "10 MB keystroke + 40-line viewport + highlight: {took:?} ({} spans on edited line)",
+            spans[0].len()
+        );
+        assert!(
+            took.as_micros() < 2_000,
+            "keystroke + viewport + highlight took {took:?}, budget is 2 ms"
+        );
     }
 
     #[test]

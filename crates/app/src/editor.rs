@@ -112,7 +112,8 @@ impl EditorState {
 
     /// Ordered selection char range when `anchor != caret`.
     pub fn selection(&self) -> Option<std::ops::Range<usize>> {
-        (self.anchor != self.caret).then(|| self.anchor.min(self.caret)..self.anchor.max(self.caret))
+        (self.anchor != self.caret)
+            .then(|| self.anchor.min(self.caret)..self.anchor.max(self.caret))
     }
 
     /// Char index where the caret draws (at the end of an active preedit).
@@ -167,7 +168,8 @@ impl EditorState {
                 if drag.clicks >= 3 {
                     let line = self.buffer.char_to_line(idx);
                     let start = self.buffer.line_to_char(line);
-                    let end = (start + self.buffer.line_len_chars(line) + 1).min(self.buffer.len_chars());
+                    let end =
+                        (start + self.buffer.line_len_chars(line) + 1).min(self.buffer.len_chars());
                     self.anchor = start;
                     self.caret = end;
                 } else if drag.clicks == 2 {
@@ -194,7 +196,10 @@ impl EditorState {
             Ime::Preedit(text, _) => {
                 if self.preedit.is_none() {
                     self.delete_selection();
-                    self.preedit = Some(Preedit { start: self.caret, text: String::new() });
+                    self.preedit = Some(Preedit {
+                        start: self.caret,
+                        text: String::new(),
+                    });
                 }
                 let _ = apply_ime(&mut self.buffer, &mut self.preedit, text, false);
                 self.reveal_caret();
@@ -203,7 +208,10 @@ impl EditorState {
             Ime::Commit(text) => {
                 if self.preedit.is_none() {
                     self.delete_selection();
-                    self.preedit = Some(Preedit { start: self.caret, text: String::new() });
+                    self.preedit = Some(Preedit {
+                        start: self.caret,
+                        text: String::new(),
+                    });
                 }
                 let start = self.preedit.as_ref().map_or(self.caret, |p| p.start);
                 if apply_ime(&mut self.buffer, &mut self.preedit, text, true).is_ok() {
@@ -334,7 +342,10 @@ impl EditorState {
             }
             Key::End => {
                 let line = self.buffer.char_to_line(self.caret);
-                self.move_to(self.buffer.line_to_char(line) + self.buffer.line_len_chars(line), shift);
+                self.move_to(
+                    self.buffer.line_to_char(line) + self.buffer.line_len_chars(line),
+                    shift,
+                );
                 true
             }
             Key::PageUp => {
@@ -416,11 +427,14 @@ impl EditorState {
             return false;
         }
         let start = if step_past_current {
-            self.selection().map_or(self.caret, |r| (r.start + 1).min(self.buffer.len_chars()))
+            self.selection()
+                .map_or(self.caret, |r| (r.start + 1).min(self.buffer.len_chars()))
         } else {
             self.selection().map_or(self.caret, |r| r.start)
         };
-        let Some(hit) = self.buffer.find_next(start, query) else { return false };
+        let Some(hit) = self.buffer.find_next(start, query) else {
+            return false;
+        };
         self.anchor = hit.start;
         self.caret = hit.end;
         self.reveal_caret();
@@ -428,7 +442,9 @@ impl EditorState {
     }
 
     fn delete_selection(&mut self) -> bool {
-        let Some(sel) = self.selection() else { return false };
+        let Some(sel) = self.selection() else {
+            return false;
+        };
         let start = sel.start;
         self.buffer.delete(sel);
         self.caret = start;
@@ -494,7 +510,9 @@ pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
     let first_line = (state.scroll_y / f64::from(LINE_H)).floor() as usize;
     let sub_y = -((state.scroll_y % f64::from(LINE_H)) as f32);
     let visible_lines = ((state.viewport_height / LINE_H).ceil() as usize).max(1);
-    let window = state.buffer.viewport(first_line, visible_lines + OVERSCAN_LINES);
+    let window = state
+        .buffer
+        .viewport(first_line, visible_lines + OVERSCAN_LINES);
 
     let expanded_lines: Vec<String> = window.iter().map(|s| expand_tabs(&s.text)).collect();
     let syntax_per_line = highlight_lines(state.language.as_deref(), &expanded_lines, theme);
@@ -504,7 +522,11 @@ pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
     let selection = state.selection();
     let num_w = state.line_number_width();
 
-    let mut rows = col().key("pen/rows").w_full().pt(PAGE_TOP_PAD).offset(0.0, sub_y);
+    let mut rows = col()
+        .key("pen/rows")
+        .w_full()
+        .pt(PAGE_TOP_PAD)
+        .offset(0.0, sub_y);
     for (row_pos, slice) in window.iter().enumerate() {
         let i = slice.line_idx;
         let line_start = state.buffer.line_to_char(i);
@@ -522,12 +544,15 @@ pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
             let c0 = sel.start.saturating_sub(line_start).min(line_chars);
             let c1 = sel.end.saturating_sub(line_start).min(line_chars);
             let x0 = visual_col(&slice.text, c0) as f32 * CHAR_ADVANCE;
-            let extra = if sel.end > line_end { CHAR_ADVANCE } else { 0.0 };
+            let extra = if sel.end > line_end {
+                CHAR_ADVANCE
+            } else {
+                0.0
+            };
             let x1 = visual_col(&slice.text, c1) as f32 * CHAR_ADVANCE + extra;
             if x1 > x0 {
                 code_cell = code_cell.child(
-                    el()
-                        .key(format!("sel-{i}"))
+                    el().key(format!("sel-{i}"))
                         .absolute(x0, 0.0)
                         .size(x1 - x0, LINE_H)
                         .fill(sel_color)
@@ -563,8 +588,7 @@ pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
                 let x1 = visual_col(&slice.text, c1) as f32 * CHAR_ADVANCE;
                 if x1 > x0 {
                     code_cell = code_cell.child(
-                        el()
-                            .key(format!("ime-{i}"))
+                        el().key(format!("ime-{i}"))
                             .absolute(x0, LINE_H - 2.0)
                             .size(x1 - x0, 1.0)
                             .fill(fg)
@@ -590,17 +614,14 @@ pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
             code_cell = code_cell.child(caret);
         }
 
-        let number = el()
-            .w(num_w)
-            .h(LINE_H)
-            .child(
-                text(format!("{}", i + 1))
-                    .w(num_w)
-                    .align(Align::End)
-                    .font(LINE_NO_FONT)
-                    .color(faint)
-                    .transition(Transition::none()),
-            );
+        let number = el().w(num_w).h(LINE_H).child(
+            text(format!("{}", i + 1))
+                .w(num_w)
+                .align(Align::End)
+                .font(LINE_NO_FONT)
+                .color(faint)
+                .transition(Transition::none()),
+        );
 
         let line_row = row()
             .key(format!("ln-{i}"))
@@ -628,8 +649,7 @@ pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
         let frac = (state.scroll_y / max_scroll).clamp(0.0, 1.0) as f32;
         let thumb_y = 8.0 + frac * (track - thumb_h);
         let rail = el().w(6.0).h_full().child(
-            el()
-                .key("pen/scroll-thumb")
+            el().key("pen/scroll-thumb")
                 .absolute(0.0, thumb_y)
                 .size(2.0, thumb_h)
                 .fill(fg.alpha(0.20))
@@ -689,7 +709,11 @@ pub fn visual_col(line: &str, char_col: usize) -> usize {
 fn char_col_at_visual(line: &str, target_vis: usize) -> usize {
     let mut vis = 0;
     for (idx, ch) in line.chars().enumerate() {
-        let w = if ch == '\t' { TAB_STOP - (vis % TAB_STOP) } else { 1 };
+        let w = if ch == '\t' {
+            TAB_STOP - (vis % TAB_STOP)
+        } else {
+            1
+        };
         if vis + w / 2 >= target_vis {
             return idx;
         }
