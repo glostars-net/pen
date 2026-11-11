@@ -1,0 +1,17 @@
+[package]
+name = "pen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pen, a code editor that feels like a pen on paper."
+
+[[bin]]
+name = "pen"
+path = "src/main.rs"
+
+[dependencies]
+rune.workspace = true
+rune-kit.workspace = true
+
+[lints]
+workspace = true

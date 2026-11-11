@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Rune is pre-release: pin a rev on `dev`, never the branch (README records it).
+rune = { git = "https://github.com/anomalyco/rune", rev = "d8f89f83e10d99ad65ca525a73b28edcc64fbcb7" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "d8f89f83e10d99ad65ca525a73b28edcc64fbcb7" }
+ropey = "1.6"
+ignore = "0.4"
+notify = "8"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
