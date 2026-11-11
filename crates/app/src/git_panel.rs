@@ -28,6 +28,7 @@ pub enum SidebarMode {
 pub enum PendingConfirm {
     Discard(PathBuf),
     RemoveWorktree(PathBuf),
+    Merge { branch: String, current: String },
 }
 
 impl PendingConfirm {
@@ -43,6 +44,9 @@ impl PendingConfirm {
             }
             PendingConfirm::RemoveWorktree(path) => {
                 format!("Remove worktree {}?", path.display())
+            }
+            PendingConfirm::Merge { branch, current } => {
+                format!("Merge {branch} into {current}?")
             }
         }
     }
@@ -219,13 +223,79 @@ pub fn changes_section<S: 'static>(
     section.child(list)
 }
 
+/// Top bar of the Git dock (Zed-style): current branch on the left, compact
+/// `"Fetch"` and `"Push"` actions on the right.
+pub fn git_remote_bar<S: 'static>(
+    current_branch: Option<&str>,
+    theme: &Theme,
+    on_fetch: impl Fn(&mut S, &mut Tx) + 'static,
+    on_push: impl Fn(&mut S, &mut Tx) + 'static,
+) -> El {
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let rule = fg.alpha(0.20);
+    let branch_label = current_branch.unwrap_or("detached");
+
+    row()
+        .key("pen/git-remote-bar")
+        .w_full()
+        .h(28.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .child(
+            text(branch_label.to_owned())
+                .font(UI_MEDIUM_FONT)
+                .color(fg)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .truncate(),
+        )
+        .child(
+            row()
+                .key("pen/git-fetch-btn")
+                .role("button")
+                .label("Fetch")
+                .focusable(true)
+                .h(22.0)
+                .px(8.0)
+                .radius(4.0)
+                .center()
+                .cursor(Cursor::Pointer)
+                .border(1.0, rule)
+                .hover(fg.alpha(0.06))
+                .transition(Transition::none())
+                .on_press_tx(on_fetch)
+                .child(text("Fetch").font(UI_FONT).color(faint)),
+        )
+        .child(
+            row()
+                .key("pen/git-push-btn")
+                .role("button")
+                .label("Push")
+                .focusable(true)
+                .h(22.0)
+                .px(8.0)
+                .radius(4.0)
+                .center()
+                .cursor(Cursor::Pointer)
+                .border(1.0, rule)
+                .hover(fg.alpha(0.06))
+                .transition(Transition::none())
+                .on_press_tx(on_push)
+                .child(text("Push").font(UI_FONT).color(faint)),
+        )
+}
+
 /// Render the `"Branches"` section inside the Git dock: clicking an inactive
-/// branch checks it out (guarded by `decide_checkout` in the app).
+/// branch checks it out; `"Merge"` prompts to merge it into the current branch.
 pub fn branches_section<S: 'static>(
     branches: &[String],
     current: Option<&str>,
     theme: &Theme,
     on_checkout: impl Fn(&mut S, String, &mut Tx) + Clone + 'static,
+    on_merge: impl Fn(&mut S, String, &mut Tx) + Clone + 'static,
 ) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
@@ -286,6 +356,25 @@ pub fn branches_section<S: 'static>(
             );
         if is_current {
             item = item.child(text("current").font(UI_FONT).color(faint));
+        } else {
+            let m_branch = branch.clone();
+            let m_cb = on_merge.clone();
+            item = item.child(
+                row()
+                    .key(format!("pen/merge-{branch}"))
+                    .role("button")
+                    .label(format!("Merge {branch}"))
+                    .focusable(true)
+                    .h(20.0)
+                    .px(6.0)
+                    .radius(4.0)
+                    .center()
+                    .cursor(Cursor::Pointer)
+                    .hover(fg.alpha(0.10))
+                    .transition(Transition::none())
+                    .on_press_tx(move |s: &mut S, tx: &mut Tx| m_cb(s, m_branch.clone(), tx))
+                    .child(text("Merge").font(UI_FONT).color(faint)),
+            );
         }
         list = list.child(item);
     }

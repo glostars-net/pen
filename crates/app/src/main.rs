@@ -17,8 +17,8 @@ use pen::editor::{CODE_SIZE, EditorState, LINE_H, editor_view_themed};
 use pen::git_guard::{CheckoutDecision, decide_checkout};
 use pen::git_panel::{
     GitPanelState, GitSnapshot, PendingConfirm, SidebarMode, branches_section, changes_section,
-    commit_bar, confirm_bar, diff_page_view, git_dock_container, history_section, status_label,
-    worktrees_section,
+    commit_bar, confirm_bar, diff_page_view, git_dock_container, git_remote_bar, history_section,
+    status_label, worktrees_section,
 };
 use pen::palette::{BUILTIN_COMMANDS, filter_command_list, shortcut_hint};
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, diff_highlighter, rgb_color};
@@ -126,6 +126,12 @@ enum IoCmd {
     RemoveWorktree {
         root: PathBuf,
         path: PathBuf,
+    },
+    RunGitCli {
+        project: Project,
+        args: Vec<String>,
+        fallback_note: String,
+        refreshes_worktree: bool,
     },
 }
 
@@ -547,6 +553,43 @@ fn setup(s: &mut Pen, waker: Waker) {
                             let _ = git_trigger_tx.try_send(refresh_root);
                             reply
                         }
+                        IoCmd::RunGitCli {
+                            project,
+                            args,
+                            fallback_note,
+                            refreshes_worktree,
+                        } => {
+                            let refresh_root = project.root.clone();
+                            let reply = tokio::task::spawn_blocking(move || {
+                                let Some(cli) = pen_git::cli::GitCli::installed() else {
+                                    return IoMsg::Error("Git is not installed.".into());
+                                };
+                                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                                match cli.run(&project.root, &refs) {
+                                    Ok(msg) => {
+                                        let note = if msg.is_empty() { fallback_note } else { msg };
+                                        if refreshes_worktree {
+                                            match project.list() {
+                                                Ok(entries) => {
+                                                    IoMsg::WorktreeUpdated { note, entries }
+                                                }
+                                                Err(e) => IoMsg::Error(e.to_string()),
+                                            }
+                                        } else {
+                                            IoMsg::StatusNote(note)
+                                        }
+                                    }
+                                    Err(e) => IoMsg::Error(pen_git::cli::truncate_one_line(
+                                        &e.to_string(),
+                                        200,
+                                    )),
+                                }
+                            })
+                            .await
+                            .unwrap_or_else(|e| IoMsg::Error(e.to_string()));
+                            let _ = git_trigger_tx.try_send(refresh_root);
+                            reply
+                        }
                     };
                     let _ = &active_watcher;
                     if msg_tx.send(reply).await.is_err() {
@@ -857,6 +900,56 @@ impl Pen {
         tx.instant();
     }
 
+    fn request_fetch(&mut self, tx: &mut Tx) {
+        let Some(project) = self.project.clone() else {
+            self.status = Some("Open a folder first.".into());
+            tx.instant();
+            return;
+        };
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::RunGitCli {
+                project,
+                args: vec!["fetch".into()],
+                fallback_note: "Fetched.".into(),
+                refreshes_worktree: false,
+            });
+        }
+    }
+
+    fn request_push(&mut self, tx: &mut Tx) {
+        let Some(project) = self.project.clone() else {
+            self.status = Some("Open a folder first.".into());
+            tx.instant();
+            return;
+        };
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::RunGitCli {
+                project,
+                args: vec!["push".into()],
+                fallback_note: "Pushed.".into(),
+                refreshes_worktree: false,
+            });
+        }
+    }
+
+    fn request_merge(&mut self, branch: String, tx: &mut Tx) {
+        if matches!(
+            decide_checkout(self.any_buffer_dirty()),
+            CheckoutDecision::KeepBuffer
+        ) {
+            self.status = Some("Changed on disk. Your copy is kept.".into());
+            tx.instant();
+            return;
+        }
+        let current = self
+            .git_status
+            .current_branch
+            .clone()
+            .unwrap_or_else(|| "HEAD".into());
+        self.git_panel.confirm = Some(PendingConfirm::Merge { branch, current });
+        tx.instant();
+    }
+
     fn confirm_pending(&mut self, tx: &mut Tx) {
         let Some(confirm) = self.git_panel.confirm.take() else {
             return;
@@ -883,6 +976,16 @@ impl Pen {
                     });
                 }
             }
+            PendingConfirm::Merge { branch, .. } => {
+                if let (Some(project), Some(io_tx)) = (self.project.clone(), &self.io_tx) {
+                    let _ = io_tx.try_send(IoCmd::RunGitCli {
+                        project,
+                        fallback_note: format!("Merged {branch}."),
+                        args: vec!["merge".into(), branch],
+                        refreshes_worktree: true,
+                    });
+                }
+            }
         }
         tx.instant();
     }
@@ -891,6 +994,9 @@ impl Pen {
         let mut cmds: Vec<String> = BUILTIN_COMMANDS.iter().map(|c| (*c).to_owned()).collect();
         for b in &self.git_status.branches {
             cmds.push(format!("Checkout {b}"));
+            if self.git_status.current_branch.as_deref() != Some(b.as_str()) {
+                cmds.push(format!("Merge {b}"));
+            }
         }
         cmds
     }
@@ -1077,6 +1183,23 @@ impl Pen {
                 }
             }
             "Commit" => self.open_commit_bar(tx),
+            "Fetch" => self.request_fetch(tx),
+            "Push" => self.request_push(tx),
+            "Merge" => {
+                let candidate = self
+                    .git_status
+                    .branches
+                    .iter()
+                    .find(|b| self.git_status.current_branch.as_deref() != Some(b.as_str()))
+                    .cloned();
+                match candidate {
+                    Some(branch) => self.request_merge(branch, tx),
+                    None => {
+                        self.status = Some("No other local branch to merge.".into());
+                        tx.instant();
+                    }
+                }
+            }
             "Add worktree" => {
                 if !self.git_panel.add_worktree_open {
                     self.toggle_add_worktree(tx);
@@ -1126,6 +1249,8 @@ impl Pen {
             _ => {
                 if let Some(branch) = name.strip_prefix("Checkout ") {
                     self.request_checkout(branch.to_owned(), tx);
+                } else if let Some(branch) = name.strip_prefix("Merge ") {
+                    self.request_merge(branch.to_owned(), tx);
                 }
             }
         }
@@ -1356,6 +1481,12 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                 .child(tree)
         }
         SidebarMode::Git => {
+            let remote = git_remote_bar(
+                s.git_status.current_branch.as_deref(),
+                &theme,
+                |s: &mut Pen, tx: &mut Tx| s.request_fetch(tx),
+                |s: &mut Pen, tx: &mut Tx| s.request_push(tx),
+            );
             let changes = changes_section(
                 &s.git_status.entries,
                 s.git_panel.selected_change.as_deref(),
@@ -1386,6 +1517,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                 s.git_status.current_branch.as_deref(),
                 &theme,
                 |s: &mut Pen, branch: String, tx: &mut Tx| s.request_checkout(branch, tx),
+                |s: &mut Pen, branch: String, tx: &mut Tx| s.request_merge(branch, tx),
             );
             let history = history_section(
                 &s.git_status.history,
@@ -1415,7 +1547,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                 |s: &mut Pen, tx: &mut Tx| s.submit_add_worktree(tx),
                 |s: &mut Pen, path: PathBuf, tx: &mut Tx| s.request_remove_worktree(path, tx),
             );
-            git_dock_container(vec![changes, branches, worktrees, history])
+            git_dock_container(vec![remote, changes, branches, worktrees, history])
         }
     };
     let mut sidebar = col()

@@ -4,6 +4,8 @@
 //! child process (and the one place Pen's own network use) lives, and only
 //! for the three allow-listed commands (fetch, push, merge).
 
+pub mod cli;
+
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +24,10 @@ pub enum GitError {
     NoIdentity,
     #[error("invalid reference name: {0}")]
     InvalidRef(String),
+    #[error("git command is not in the allow-list")]
+    NotAllowed,
+    #[error("{0}")]
+    CliFailed(String),
 }
 
 pub struct Repo {
