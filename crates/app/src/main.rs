@@ -1587,7 +1587,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
             row()
                 .key("pen/sidebar-tabs")
                 .w_full()
-                .h(34.0)
+                .h(36.0)
                 .px(8.0)
                 .gap(4.0)
                 .center_y()
@@ -2011,6 +2011,16 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.theme_pref = ThemePref::Ink;
         populate_demo_diff(s, &highlight::ink());
     }),
+    ("git-ink", |s| {
+        s.theme_pref = ThemePref::Ink;
+        populate_demo_diff(s, &highlight::ink());
+        s.git_panel.mode = SidebarMode::Git;
+    }),
+    ("git-paper", |s| {
+        s.theme_pref = ThemePref::Paper;
+        populate_demo_diff(s, &highlight::paper());
+        s.git_panel.mode = SidebarMode::Git;
+    }),
 ];
 
 fn populate_demo_editor(s: &mut Pen) {
@@ -2104,7 +2114,7 @@ fn populate_demo_diff(s: &mut Pen, theme: &Theme) {
             },
         ],
         worktrees: vec![pen_git::WorktreeInfo {
-            path: PathBuf::from("."),
+            path: PathBuf::from("pen"),
             branch: "main".into(),
         }],
     };

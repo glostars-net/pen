@@ -97,6 +97,7 @@ dropped automatically and replaced by the derived five-step OKLab ink ramp.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — system invariants, thread/channel topology, crate DAG, and Phase 2–5 extension guide.
 - [`.interface-design/system.md`](.interface-design/system.md) — design tokens, contrast ratios, proportions, and motion rules.
 - `crates/buffer` — `ropey` text buffer, inverse-edit undo (cap 256), viewport slicing, literal scalar find, IME preedit boundary.
+- `crates/git` (`pen-git`) — `gix` facade for status, commit history, unified/split patches, staging, commits, branch checkout, discard, and worktrees, plus the allow-listed `GitCli` (`fetch`, `push`, `merge`).
 - `crates/project` — `.gitignore`-aware folder walk, path-confined UTF-8 reader, atomic `.pen-tmp` writer, 50 ms debounced `notify` watcher.
 - `crates/highlight` — Ink & Paper themes, WCAG contrast enforcement, OKLab five-step syntax ramp via `rune_kit::syntax`.
 - `crates/app` — the `pen` binary & library: Rune `SplitView` shell, viewport editor surface, instant command palette, single-line Find bar.
@@ -128,3 +129,23 @@ Gate verified on `rustc 1.99.1` against pinned Rune rev
   - **Empty screen:** confirmed (sentence-case `"Open a folder"` is the sole control on the empty screen).
   - **Instant command palette & Find bar:** confirmed (`Transition::none()` + `tx.instant()`, `6px` chrome radius with concentric `4px` inner row radius; Find is a single `38pt` line directly above the page).
   - **Caret:** confirmed (`1.5px` solid ink stroke, moves in `0ms`, `.ime_cursor()` attached to `App::on_ime` without wrapping the buffer in `TextArea`).
+
+---
+
+## Phase 2
+
+Gate verified on `rustc 1.99.1` against pinned Rune rev
+`d8f89f83e10d99ad65ca525a73b28edcc64fbcb7`:
+
+- **`gix` version:** `0.90.0` (`crates/git`, package `pen-git`). Status, history (`log`), unstaged & commit diffs, staging, commits, local branch listing/checkout, file discard, and worktree list/add/remove all run off the UI thread through `gix` with zero child processes.
+- **`git` CLI allow-list (`pen_git::cli::GitCli`):** `fetch`, `push`, `merge` — and nothing else. Any other subcommand (`reset`, `rebase`, …), any flag (`--force`, `-f`, `--hard`, `--no-ff`, …), and any force refspec (`+…`) are rejected before spawning with `GitError::NotAllowed`. When `git` is absent from `PATH`, status line reports `"Git is not installed."` while `gix` status/log/diff continue refreshing normally; `stderr` is captured and truncated at 200 characters.
+- **Dirty-buffer & destructive-action guards:** `decide_checkout` blocks branch checkout, file discard, worktree removal, and merge whenever an editor buffer is dirty (`"Changed on disk. Your copy is kept."`). Discard (`"Discard changes to {name}?"`), worktree removal (`"Remove worktree {path}?"`), and merge (`"Merge {branch} into {current}?"`) require explicit inline confirmation before running.
+- **Verification suite (`just gate`):**
+  ```sh
+  cargo fmt --all -- --check
+  cargo clippy --all-targets -- -D warnings
+  cargo test --all-targets
+  ```
+- **Design check (inspected 2× Retina Ink and Paper frames across `diff-paper`, `diff-ink`, `git-paper`, and `git-ink` scenes):**
+  - **Monochrome ink-step diff:** confirmed (`theme.added` and `theme.removed` derive from contrast-checked `>= 4.5:1` OKLab ink steps mapped onto `rune_kit::DiffView`, paired with a five-step monochrome `diff_highlighter`; zero green/red diff bars or rainbow syntax).
+  - **Tree & Changes status labels:** confirmed (`+n −n` using true minus `U+2212` for tracked modifications and `new` for untracked files in `theme.faint` tabular numerals; no colored status dot).
