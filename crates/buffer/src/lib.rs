@@ -4,6 +4,9 @@
 //! knows nothing about files, themes or the UI; `crates/project` does disk,
 //! `crates/app` does drawing.
 
+mod ime;
+pub use ime::*;
+
 use std::collections::VecDeque;
 
 /// Undo entries kept; the oldest drops past this.
@@ -144,6 +147,23 @@ impl Buffer {
                 Edit::Insert { at, text: removed }
             }
         }
+    }
+
+    /// Replace a char range without touching undo, redo or dirty. For IME
+    /// preedit text only (`ime::apply_ime`), which shows in the rope but was
+    /// never an edit.
+    pub(crate) fn replace_silent(&mut self, range: std::ops::Range<usize>, text: &str) {
+        if !range.is_empty() {
+            self.rope.remove(range.clone());
+        }
+        if !text.is_empty() {
+            self.rope.insert(range.start, text);
+        }
+    }
+
+    /// For `ime::apply_ime`: a preedit must leave dirty as it found it.
+    pub(crate) fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
     }
 
     fn push_undo(&mut self, edit: Edit) {
