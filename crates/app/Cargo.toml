@@ -15,8 +15,10 @@ path = "src/main.rs"
 
 [dependencies]
 buffer = { path = "../buffer" }
+project = { path = "../project" }
 rune.workspace = true
 rune-kit.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

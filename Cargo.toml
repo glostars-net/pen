@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/buffer"]
+members = ["crates/app", "crates/buffer", "crates/project"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,7 +9,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Rune is pre-release: pin a rev on `dev`, never the branch (README records it).
-rune = { git = "https://github.com/anomalyco/rune", rev = "d8f89f83e10d99ad65ca525a73b28edcc64fbcb7" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "d8f89f83e10d99ad65ca525a73b28edcc64fbcb7", features = ["native-file-dialog"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "d8f89f83e10d99ad65ca525a73b28edcc64fbcb7" }
 ropey = "1.6"
 ignore = "0.4"
@@ -26,5 +26,18 @@ unused_must_use = "deny"
 unwrap_used = "warn"
 dbg_macro = "deny"
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
+strip = "symbols"
