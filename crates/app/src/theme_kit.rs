@@ -96,6 +96,18 @@ pub fn build_kit(theme: &Theme) -> Kit {
     k.ty.body_medium = UI_MEDIUM_FONT;
     k.ty.text_small = UI_FONT;
     k.ty.text_small_medium = UI_MEDIUM_FONT;
+    k.ty.text_xsmall = TextStyle {
+        size: 11.0,
+        line_height: 16.0,
+        features: "'tnum' 1",
+        ..UI_FONT
+    };
+    k.ty.text_xsmall_medium = TextStyle {
+        size: 11.0,
+        line_height: 16.0,
+        features: "'tnum' 1",
+        ..UI_MEDIUM_FONT
+    };
 
     // Disclosure spring matches Design (0.35s, bounce 0).
     k.motion.disclosure = Spring::new(0.35, 0.0);

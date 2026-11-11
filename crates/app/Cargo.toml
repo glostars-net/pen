@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 buffer = { path = "../buffer" }
 highlight = { path = "../highlight" }
+pen-git = { path = "../git" }
 project = { path = "../project" }
 rune.workspace = true
 rune-kit.workspace = true

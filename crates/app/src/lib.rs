@@ -3,6 +3,7 @@
 
 pub mod disk;
 pub mod editor;
+pub mod git_panel;
 pub mod palette;
 pub mod theme_kit;
 

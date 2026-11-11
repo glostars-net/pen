@@ -25,6 +25,10 @@ pub struct StatusEntry {
     pub rel: PathBuf,
     pub added: u32,
     pub removed: u32,
+    /// `false` for an untracked file (git has never seen it), `true` for a
+    /// tracked file with a worktree modification. Lets callers show "new"
+    /// instead of a line count.
+    pub tracked: bool,
 }
 
 impl Repo {
@@ -75,6 +79,7 @@ impl Repo {
                         rel,
                         added,
                         removed,
+                        tracked: true,
                     });
                 }
                 gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
@@ -82,6 +87,7 @@ impl Repo {
                         rel: PathBuf::from(entry.rela_path.to_string()),
                         added: 0,
                         removed: 0,
+                        tracked: false,
                     });
                 }
                 // Rename/copy pairs: not tracked unless rewrite tracking is turned on,

@@ -3594,6 +3594,7 @@ version = "0.1.0"
 dependencies = [
  "buffer",
  "highlight",
+ "pen-git",
  "project",
  "rune",
  "rune-kit",

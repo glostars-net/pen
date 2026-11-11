@@ -5,14 +5,16 @@
 //! disk or watcher work; a Tokio worker handles all filesystem calls and wakes
 //! the window via `Waker`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use buffer::Buffer;
 use highlight::{Theme, lang_for_path, load_theme};
 use pen::disk::{DiskEvent, on_disk_change};
 use pen::editor::{CODE_SIZE, EditorState, LINE_H, editor_view_themed};
+use pen::git_panel::{GitSnapshot, status_label};
 use pen::palette::{BUILTIN_COMMANDS, filter_commands, shortcut_hint};
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, rgb_color};
 use project::watch::{ProjectWatcher, WatchEvent, watch_project_with};
@@ -26,6 +28,10 @@ use rune::{
 use rune_kit::shell::{self, PaneMotion, PaneState, SplitView, Toolbar};
 use rune_kit::{FileNode, FileTree, Tree, TreeItem, TreeModel};
 use tokio::sync::{mpsc, watch};
+
+/// Git status refreshes at most this often (Task 2): a burst of triggers
+/// (opening a project, several quick saves) collapses into one refresh.
+const GIT_STATUS_THROTTLE: Duration = Duration::from_millis(200);
 
 const FIND_FONT: TextStyle = TextStyle {
     size: CODE_SIZE,
@@ -136,6 +142,8 @@ struct Pen {
     page_opacity: f32,
     reveal_first_launch: bool,
     watch_rx: Option<watch::Receiver<Option<WatchEvent>>>,
+    git_status: GitSnapshot,
+    git_rx: Option<watch::Receiver<GitSnapshot>>,
     io_tx: Option<mpsc::Sender<IoCmd>>,
     io_rx: Option<mpsc::Receiver<IoMsg>>,
 }
@@ -158,6 +166,8 @@ fn init() -> Pen {
         page_opacity: 1.0,
         reveal_first_launch: false,
         watch_rx: None,
+        git_status: GitSnapshot::default(),
+        git_rx: None,
         io_tx: None,
         io_rx: None,
     }
@@ -167,6 +177,8 @@ fn setup(s: &mut Pen, waker: Waker) {
     let headless = rune::is_headless();
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<IoCmd>(32);
     let (msg_tx, msg_rx) = mpsc::channel::<IoMsg>(32);
+    let (git_trigger_tx, mut git_trigger_rx) = mpsc::channel::<PathBuf>(8);
+    let (git_tx, git_rx) = watch::channel(GitSnapshot::default());
     if !headless && let Some(arg) = rune::extra_args().iter().find(|a| !a.starts_with('-')) {
         let _ = cmd_tx.try_send(IoCmd::OpenProject(PathBuf::from(arg)));
     }
@@ -181,6 +193,37 @@ fn setup(s: &mut Pen, waker: Waker) {
                 return;
             };
             rt.block_on(async move {
+                // Git status: collapses a burst of triggers (project open, several
+                // quick saves) into one refresh at most every `GIT_STATUS_THROTTLE`.
+                tokio::spawn({
+                    let waker = waker.clone();
+                    async move {
+                        let mut last_refresh = Instant::now() - GIT_STATUS_THROTTLE;
+                        while let Some(root) = git_trigger_rx.recv().await {
+                            while git_trigger_rx.try_recv().is_ok() {}
+                            let elapsed = last_refresh.elapsed();
+                            if elapsed < GIT_STATUS_THROTTLE {
+                                tokio::time::sleep(GIT_STATUS_THROTTLE - elapsed).await;
+                                while git_trigger_rx.try_recv().is_ok() {}
+                            }
+                            let entries = tokio::task::spawn_blocking(move || {
+                                pen_git::Repo::discover(&root)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|r| r.status().ok())
+                                    .unwrap_or_default()
+                            })
+                            .await
+                            .unwrap_or_default();
+                            last_refresh = Instant::now();
+                            if git_tx.send(GitSnapshot { entries }).is_err() {
+                                break;
+                            }
+                            waker();
+                        }
+                    }
+                });
+
                 if !headless {
                     let (theme_pref, first_launch) =
                         tokio::task::spawn_blocking(read_startup_prefs_blocking)
@@ -211,13 +254,19 @@ fn setup(s: &mut Pen, waker: Waker) {
                             match res {
                                 Ok((project, entries)) => {
                                     let w = waker.clone();
-                                    let watch_rx = match watch_project_with(&project, move || w()) {
+                                    let watcher_git_tx = git_trigger_tx.clone();
+                                    let watcher_root = project.root.clone();
+                                    let watch_rx = match watch_project_with(&project, move || {
+                                        let _ = watcher_git_tx.try_send(watcher_root.clone());
+                                        w();
+                                    }) {
                                         Ok((guard, rx)) => {
                                             active_watcher = Some(guard);
                                             Some(rx)
                                         }
                                         Err(_) => None,
                                     };
+                                    let _ = git_trigger_tx.try_send(project.root.clone());
                                     IoMsg::ProjectListed {
                                         project,
                                         entries,
@@ -266,14 +315,19 @@ fn setup(s: &mut Pen, waker: Waker) {
                             project,
                             rel,
                             bytes,
-                        } => tokio::task::spawn_blocking(move || {
-                            project.write_atomic(&rel, &bytes)?;
-                            Ok::<_, project::ProjectError>(rel)
-                        })
-                        .await
-                        .map_err(|e| e.to_string())
-                        .and_then(|r| r.map_err(|e| e.to_string()))
-                        .map_or_else(IoMsg::Error, |rel| IoMsg::FileSaved { rel }),
+                        } => {
+                            let root = project.root.clone();
+                            let reply = tokio::task::spawn_blocking(move || {
+                                project.write_atomic(&rel, &bytes)?;
+                                Ok::<_, project::ProjectError>(rel)
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.map_err(|e| e.to_string()))
+                            .map_or_else(IoMsg::Error, |rel| IoMsg::FileSaved { rel });
+                            let _ = git_trigger_tx.try_send(root);
+                            reply
+                        }
                         IoCmd::SaveThemePref(choice) => {
                             let _ = tokio::task::spawn_blocking(move || {
                                 write_theme_pref_blocking(choice)
@@ -293,6 +347,7 @@ fn setup(s: &mut Pen, waker: Waker) {
         .ok();
     s.io_tx = Some(cmd_tx);
     s.io_rx = Some(msg_rx);
+    s.git_rx = Some(git_rx);
 }
 
 fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
@@ -334,6 +389,16 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
         {
             let _ = io_tx.try_send(IoCmd::RefreshTree(project));
         }
+    }
+
+    let git_snapshot = s
+        .git_rx
+        .as_mut()
+        .filter(|rx| rx.has_changed().unwrap_or(false))
+        .map(|rx| rx.borrow_and_update().clone());
+    if let Some(snapshot) = git_snapshot {
+        s.git_status = snapshot;
+        changed = true;
     }
 
     let mut batch = Vec::new();
@@ -730,9 +795,25 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         );
     }
 
+    let git_labels: Rc<HashMap<PathBuf, String>> = Rc::new(
+        s.git_status
+            .entries
+            .iter()
+            .filter_map(|e| {
+                let lbl = status_label(e);
+                (!lbl.is_empty()).then(|| (e.rel.clone(), lbl))
+            })
+            .collect(),
+    );
     let tree = Tree::new(|s: &Pen| &s.files, |s: &mut Pen| &mut s.files, tree_label)
         .name("Files")
-        .row(TreeItem::file)
+        .row(move |node, r| {
+            let item = TreeItem::file(node, r);
+            match node.data.as_ref().and_then(|rel| git_labels.get(rel)) {
+                Some(lbl) => item.badge(lbl.clone()),
+                None => item,
+            }
+        })
         .on_select(|s: &mut Pen, id: &str, tx: &mut Tx| s.request_open_file(id, tx))
         .on_open(|s: &mut Pen, id: &str, tx: &mut Tx| s.request_open_file(id, tx))
         .build(s, &k)
