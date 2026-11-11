@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 buffer = { path = "../buffer" }
+highlight = { path = "../highlight" }
 project = { path = "../project" }
 rune.workspace = true
 rune-kit.workspace = true

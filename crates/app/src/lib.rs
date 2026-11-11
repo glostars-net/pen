@@ -1,8 +1,9 @@
-//! Pen's library surface: bundled fonts, the editor page, and the modules
-//! integration tests share with the `pen` binary.
+//! Pen's library surface: bundled fonts, the editor page, theme mapping, and
+//! disk rules shared between the `pen` binary and integration tests.
 
 pub mod disk;
 pub mod editor;
+pub mod theme_kit;
 
 /// Bundled OFL faces (IBM Plex Sans for chrome, IBM Plex Mono for code).
 /// No third family, no script face.

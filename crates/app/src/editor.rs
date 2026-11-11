@@ -7,11 +7,13 @@
 //! tests mount `EditorState` directly while `main.rs` mounts it inside `Pen`.
 
 use buffer::{Buffer, Preedit, apply_ime};
-use rune::color::hex;
+use highlight::{Theme, highlight_lines};
 use rune::{
-    Align, Color, Drag, El, Family, Ime, Key, KeyEvent, OpticalSize, Phase, TextStyle, Transition,
-    col, el, row, text,
+    Align, Drag, El, Family, Ime, Key, KeyEvent, OpticalSize, Phase, Span, TextStyle, Transition,
+    col, el, rich, row, text,
 };
+
+use crate::theme_kit::rgb_color;
 
 /// Code size in points (Design: 13px, line-height 1.55, tracking 0).
 pub const CODE_SIZE: f32 = 13.0;
@@ -57,26 +59,6 @@ const LINE_NO_FONT: TextStyle = TextStyle {
     italic: false,
 };
 
-/// Paper palette used until Task 9 swaps in `highlight::Theme`.
-#[derive(Clone, Copy, Debug)]
-pub struct PagePalette {
-    pub bg: Color,
-    pub fg: Color,
-    pub faint: Color,
-    pub selection: Color,
-}
-
-impl PagePalette {
-    /// Paper from Design (`#f6f4f0` ground, `#1a1916` ink, `#5c5954` faint at
-    /// 6.35:1, selection = foreground at 12%).
-    pub fn paper() -> Self {
-        let bg = hex("#f6f4f0").unwrap_or(Color::WHITE);
-        let fg = hex("#1a1916").unwrap_or(Color::BLACK);
-        let faint = hex("#5c5954").unwrap_or(fg);
-        Self { bg, fg, faint, selection: fg.alpha(0.12) }
-    }
-}
-
 /// An open editor page: one `Buffer`, one caret, an optional selection anchor,
 /// and an optional IME composition.
 pub struct EditorState {
@@ -93,7 +75,9 @@ pub struct EditorState {
     pub viewport_height: f32,
     /// Whether this page owns the keyboard (controls `.ime_cursor()`).
     pub focused: bool,
-    pub palette: PagePalette,
+    pub theme: Theme,
+    /// Language alias from `highlight::lang_for_path` (e.g. `"rust"`).
+    pub language: Option<String>,
 }
 
 impl EditorState {
@@ -111,8 +95,19 @@ impl EditorState {
             scroll_y: 0.0,
             viewport_height: 600.0,
             focused: true,
-            palette: PagePalette::paper(),
+            theme: highlight::paper(),
+            language: None,
         }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    pub fn with_language(mut self, lang: Option<&str>) -> Self {
+        self.language = lang.map(str::to_owned);
+        self
     }
 
     /// Ordered selection char range when `anchor != caret`.
@@ -485,13 +480,24 @@ impl EditorState {
 }
 
 /// Draw the editor page from `state`. Pure function of `&EditorState`: reads
-/// only `viewport(first_line, visible + OVERSCAN_LINES)`.
+/// and highlights only `viewport(first_line, visible + OVERSCAN_LINES)`.
 pub fn editor_view(state: &EditorState) -> El {
-    let p = state.palette;
+    editor_view_themed(state, &state.theme)
+}
+
+pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let sel_color = fg.alpha(0.12);
+
     let first_line = (state.scroll_y / f64::from(LINE_H)).floor() as usize;
     let sub_y = -((state.scroll_y % f64::from(LINE_H)) as f32);
     let visible_lines = ((state.viewport_height / LINE_H).ceil() as usize).max(1);
     let window = state.buffer.viewport(first_line, visible_lines + OVERSCAN_LINES);
+
+    let expanded_lines: Vec<String> = window.iter().map(|s| expand_tabs(&s.text)).collect();
+    let syntax_per_line = highlight_lines(state.language.as_deref(), &expanded_lines, theme);
 
     let caret_pos = state.visual_caret();
     let caret_line = state.buffer.char_to_line(caret_pos);
@@ -499,12 +505,12 @@ pub fn editor_view(state: &EditorState) -> El {
     let num_w = state.line_number_width();
 
     let mut rows = col().key("pen/rows").w_full().pt(PAGE_TOP_PAD).offset(0.0, sub_y);
-    for slice in &window {
+    for (row_pos, slice) in window.iter().enumerate() {
         let i = slice.line_idx;
         let line_start = state.buffer.line_to_char(i);
         let line_chars = slice.text.chars().count();
         let line_end = line_start + line_chars;
-        let expanded = expand_tabs(&slice.text);
+        let expanded = &expanded_lines[row_pos];
 
         let mut code_cell = el().grow(1.0).h(LINE_H);
 
@@ -524,16 +530,24 @@ pub fn editor_view(state: &EditorState) -> El {
                         .key(format!("sel-{i}"))
                         .absolute(x0, 0.0)
                         .size(x1 - x0, LINE_H)
-                        .fill(p.selection)
+                        .fill(sel_color)
                         .transition(Transition::none()),
                 );
             }
         }
 
-        // The code text itself.
-        code_cell = code_cell.child(
-            text(expanded).font(CODE_FONT).color(p.fg).transition(Transition::none()),
-        );
+        // Code line: five-step OKLab syntax ramp over the viewport only.
+        let line_spans = &syntax_per_line[row_pos];
+        let text_el = if line_spans.is_empty() {
+            text(expanded.clone()).font(CODE_FONT).color(fg).transition(Transition::none())
+        } else {
+            let spans: Vec<Span> = line_spans
+                .iter()
+                .map(|(r, rgb)| Span::new(r.start, r.end).color(rgb_color(*rgb)))
+                .collect();
+            rich(expanded.clone(), spans).font(CODE_FONT).color(fg).transition(Transition::none())
+        };
+        code_cell = code_cell.child(text_el);
 
         // Active IME preedit underline (1 px solid ink under the composition).
         if let Some(pre) = &state.preedit
@@ -551,7 +565,7 @@ pub fn editor_view(state: &EditorState) -> El {
                             .key(format!("ime-{i}"))
                             .absolute(x0, LINE_H - 2.0)
                             .size(x1 - x0, 1.0)
-                            .fill(p.fg)
+                            .fill(fg)
                             .transition(Transition::none()),
                     );
                 }
@@ -566,7 +580,7 @@ pub fn editor_view(state: &EditorState) -> El {
                 .key("pen/caret")
                 .absolute(cx, 2.0)
                 .size(CARET_WIDTH, LINE_H - 4.0)
-                .fill(p.fg)
+                .fill(fg)
                 .transition(Transition::none());
             if state.focused {
                 caret = caret.ime_cursor();
@@ -582,7 +596,7 @@ pub fn editor_view(state: &EditorState) -> El {
                     .w(num_w)
                     .align(Align::End)
                     .font(LINE_NO_FONT)
-                    .color(p.faint)
+                    .color(faint)
                     .transition(Transition::none()),
             );
 
@@ -616,7 +630,7 @@ pub fn editor_view(state: &EditorState) -> El {
                 .key("pen/scroll-thumb")
                 .absolute(0.0, thumb_y)
                 .size(2.0, thumb_h)
-                .fill(p.fg.alpha(0.20))
+                .fill(fg.alpha(0.20))
                 .transition(Transition::none()),
         );
         body = body.child(rail);
@@ -626,7 +640,7 @@ pub fn editor_view(state: &EditorState) -> El {
         .key("pen/editor")
         .w_full()
         .h_full()
-        .fill(p.bg)
+        .fill(bg)
         .clip_rounded(0.0)
         .instant_changes()
         .transition(Transition::none())

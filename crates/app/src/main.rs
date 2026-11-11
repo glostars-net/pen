@@ -9,29 +9,41 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use buffer::Buffer;
+use highlight::{Theme, lang_for_path, load_theme};
 use pen::disk::{DiskEvent, on_disk_change};
-use pen::editor::{EditorState, PagePalette, editor_view};
+use pen::editor::EditorState;
+use pen::theme_kit::{UI_FONT, build_kit, rgb_color};
 use project::watch::{ProjectWatcher, WatchEvent, watch_project_with};
 use project::{FileEntry, Project, ReadFile};
+use rune::dirs::AppDirs;
 use rune::{
-    AppSpec, Cursor, Cx, Drag, El, Family, Ime, Key, KeyEvent, OpticalSize, Spring, TextStyle,
-    Transition, Tx, Waker, WheelEvent, col, text,
+    AppSpec, Cursor, Cx, Drag, El, Ime, Key, KeyEvent, Spring, Transition, Tx, Waker, WheelEvent,
+    col, text,
 };
 use rune_kit::shell::{self, PaneMotion, PaneState, SplitView, Toolbar};
-use rune_kit::{FileNode, FileTree, Kit, Tree, TreeItem, TreeModel};
+use rune_kit::{FileNode, FileTree, Tree, TreeItem, TreeModel};
 use tokio::sync::{mpsc, watch};
 
-const UI_FONT: TextStyle = TextStyle {
-    size: 13.0,
-    weight: 400.0,
-    family: Family::Sans,
-    line_height: 20.0,
-    tracking: 0.0,
-    variations: "",
-    features: "",
-    optical_size: OpticalSize::Auto,
-    italic: false,
-};
+#[derive(Clone, Debug)]
+enum ThemePref {
+    System,
+    Ink,
+    Paper,
+    Custom(Box<Theme>),
+}
+
+impl ThemePref {
+    fn resolve(&self, system_dark: bool) -> Theme {
+        match self {
+            ThemePref::System => {
+                if system_dark { highlight::ink() } else { highlight::paper() }
+            }
+            ThemePref::Ink => highlight::ink(),
+            ThemePref::Paper => highlight::paper(),
+            ThemePref::Custom(t) => (**t).clone(),
+        }
+    }
+}
 
 /// Requests sent from the UI thread to the Tokio disk worker.
 enum IoCmd {
@@ -40,10 +52,12 @@ enum IoCmd {
     ReadFile { project: Project, rel: PathBuf },
     ReloadCleanFile { project: Project, rel: PathBuf },
     SaveFile { project: Project, rel: PathBuf, bytes: Vec<u8> },
+    SaveThemePref(&'static str),
 }
 
 /// Answers sent back from the Tokio disk worker to `poll`.
 enum IoMsg {
+    PrefsLoaded { theme_pref: ThemePref },
     ProjectListed {
         project: Project,
         entries: Vec<FileEntry>,
@@ -72,6 +86,7 @@ struct Pen {
     /// Unsaved buffers kept in memory when switching files so clicking another
     /// file in the tree never discards work.
     unsaved: BTreeMap<PathBuf, EditorState>,
+    theme_pref: ThemePref,
     status: Option<String>,
     watch_rx: Option<watch::Receiver<Option<WatchEvent>>>,
     io_tx: Option<mpsc::Sender<IoCmd>>,
@@ -86,6 +101,7 @@ fn init() -> Pen {
         active_path: None,
         page: OpenPage::Empty,
         unsaved: BTreeMap::new(),
+        theme_pref: ThemePref::System,
         status: None,
         watch_rx: None,
         io_tx: None,
@@ -110,6 +126,13 @@ fn setup(s: &mut Pen, waker: Waker) {
                 return;
             };
             rt.block_on(async move {
+                // Load stored theme preference off the UI thread.
+                let theme_pref = tokio::task::spawn_blocking(read_theme_pref_blocking)
+                    .await
+                    .unwrap_or(ThemePref::System);
+                let _ = msg_tx.send(IoMsg::PrefsLoaded { theme_pref }).await;
+                waker();
+
                 let mut active_watcher: Option<ProjectWatcher> = None;
                 while let Some(cmd) = cmd_rx.recv().await {
                     let reply = match cmd {
@@ -179,6 +202,13 @@ fn setup(s: &mut Pen, waker: Waker) {
                             .and_then(|r| r.map_err(|e| e.to_string()))
                             .map_or_else(IoMsg::Error, |rel| IoMsg::FileSaved { rel })
                         }
+                        IoCmd::SaveThemePref(choice) => {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                write_theme_pref_blocking(choice)
+                            })
+                            .await;
+                            continue;
+                        }
                     };
                     let _ = &active_watcher;
                     if msg_tx.send(reply).await.is_err() {
@@ -237,6 +267,10 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
     }
     for msg in batch {
         match msg {
+            IoMsg::PrefsLoaded { theme_pref } => {
+                s.theme_pref = theme_pref;
+                tx.instant();
+            }
             IoMsg::ProjectListed { project, entries, watch_rx } => {
                 s.files = build_file_tree(entries);
                 s.project = Some(project);
@@ -259,12 +293,13 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
             }
             IoMsg::FileRead { rel, result } => {
                 s.stash_current_if_dirty();
+                let lang = lang_for_path(rel.to_string_lossy().as_ref());
                 s.active_path = Some(rel);
                 s.page = match result {
                     ReadFile::Utf8(src) => {
                         let mut buf = Buffer::from_str(&src);
                         buf.mark_saved();
-                        OpenPage::Editor(EditorState::from_buffer(buf))
+                        OpenPage::Editor(EditorState::from_buffer(buf).with_language(lang))
                     }
                     ReadFile::NotUtf8 => OpenPage::Notice("This file is not UTF-8.".into()),
                 };
@@ -380,60 +415,57 @@ fn tree_label(n: &FileNode<PathBuf>) -> &str {
     n.label()
 }
 
+fn read_theme_pref_blocking() -> ThemePref {
+    let Some(dirs) = AppDirs::new("pen") else { return ThemePref::System };
+    let custom_json = dirs.config().join("theme.json");
+    if let Ok(raw) = std::fs::read_to_string(custom_json)
+        && let Ok(theme) = load_theme(&raw)
+    {
+        return ThemePref::Custom(Box::new(theme));
+    }
+    let choice_path = dirs.config().join("theme");
+    match std::fs::read_to_string(choice_path).ok().as_deref().map(str::trim) {
+        Some("ink") => ThemePref::Ink,
+        Some("paper") => ThemePref::Paper,
+        _ => ThemePref::System,
+    }
+}
+
+fn write_theme_pref_blocking(choice: &str) {
+    let Some(dirs) = AppDirs::new("pen") else { return };
+    if std::fs::create_dir_all(dirs.config()).is_err() {
+        return;
+    }
+    let tmp = dirs.config().join(".theme.pen-tmp");
+    let dst = dirs.config().join("theme");
+    if std::fs::write(&tmp, choice.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &dst);
+    }
+}
+
 fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
-    let k = Kit::neutral(cx.system_dark());
-    let paper = PagePalette::paper();
+    let theme = s.theme_pref.resolve(cx.system_dark());
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    cx.focus_ring(1.0, 1.0, fg);
+    let k = build_kit(&theme);
+
     let page = match &s.page {
-        OpenPage::Editor(ed) => col()
-            .key("pen/page")
-            .w_full()
-            .h_full()
-            .cursor(Cursor::Text)
-            .transition(Transition::none())
-            .on_layout_tx(|s: &mut Pen, r: [f32; 4], tx: &mut Tx| {
-                if let OpenPage::Editor(ed) = &mut s.page
-                    && (ed.viewport_height - r[3]).abs() > 0.5
-                {
-                    ed.viewport_height = r[3].max(60.0);
-                } else {
-                    tx.live_only();
-                }
-            })
-            .on_wheel(|s: &mut Pen, ev: WheelEvent, tx: &mut Tx| {
-                if let OpenPage::Editor(ed) = &mut s.page {
-                    ed.scroll_by(ev.dy);
-                    tx.instant();
-                    return true;
-                }
-                false
-            })
-            .on_drag(|s: &mut Pen, drag: &mut Drag, tx: &mut Tx| {
-                let shift = tx.mods().shift;
-                if let OpenPage::Editor(ed) = &mut s.page {
-                    ed.on_drag(drag, shift);
-                    tx.instant();
-                }
-            })
-            .on_paste(|s: &mut Pen, clip: &str, tx: &mut Tx| {
-                if let OpenPage::Editor(ed) = &mut s.page {
-                    ed.insert_text(clip);
-                    tx.instant();
-                }
-            })
-            .child(editor_view(ed)),
+        OpenPage::Editor(ed) => editor_page_container(ed, &theme),
         OpenPage::Notice(msg) => col()
             .key("pen/notice")
             .w_full()
             .h_full()
-            .fill(paper.bg)
+            .fill(bg)
             .center()
             .transition(Transition::none())
-            .child(text(msg.clone()).font(UI_FONT).color(paper.faint)),
+            .child(text(msg.clone()).font(UI_FONT).color(faint)),
         OpenPage::Empty => col()
             .key("pen/page-empty")
             .w_full()
             .h_full()
-            .fill(paper.bg)
+            .fill(bg)
             .transition(Transition::none()),
     };
 
@@ -445,7 +477,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         .build(s, &k)
         .grow(1.0)
         .min_h(0.0);
-    let sidebar = col().key("pen/sidebar").w_full().h_full().padding(8.0).child(tree);
+    let sidebar = col().key("pen/sidebar").w_full().h_full().padding(8.0).fill(bg).child(tree);
 
     SplitView::new(page)
         .sidebar(&s.sidebar, |s: &mut Pen| &mut s.sidebar, sidebar)
@@ -454,6 +486,46 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         .pane_motion(PaneMotion::new().spring(Spring::new(0.35, 0.0)))
         .reduced_motion(cx.is_reduced_motion())
         .build(&k)
+}
+
+fn editor_page_container(ed: &EditorState, theme: &Theme) -> El {
+    col()
+        .key("pen/page")
+        .w_full()
+        .h_full()
+        .cursor(Cursor::Text)
+        .transition(Transition::none())
+        .on_layout_tx(|s: &mut Pen, r: [f32; 4], tx: &mut Tx| {
+            if let OpenPage::Editor(ed) = &mut s.page
+                && (ed.viewport_height - r[3]).abs() > 0.5
+            {
+                ed.viewport_height = r[3].max(60.0);
+            } else {
+                tx.live_only();
+            }
+        })
+        .on_wheel(|s: &mut Pen, ev: WheelEvent, tx: &mut Tx| {
+            if let OpenPage::Editor(ed) = &mut s.page {
+                ed.scroll_by(ev.dy);
+                tx.instant();
+                return true;
+            }
+            false
+        })
+        .on_drag(|s: &mut Pen, drag: &mut Drag, tx: &mut Tx| {
+            let shift = tx.mods().shift;
+            if let OpenPage::Editor(ed) = &mut s.page {
+                ed.on_drag(drag, shift);
+                tx.instant();
+            }
+        })
+        .on_paste(|s: &mut Pen, clip: &str, tx: &mut Tx| {
+            if let OpenPage::Editor(ed) = &mut s.page {
+                ed.insert_text(clip);
+                tx.instant();
+            }
+        })
+        .child(pen::editor::editor_view_themed(ed, theme))
 }
 
 fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
