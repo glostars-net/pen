@@ -7,6 +7,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "Save",
     "Find",
     "Stage file",
+    "Discard file",
     "Commit",
     "Split diff",
     "Use Ink",
@@ -15,11 +16,16 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
 
 /// Case-insensitive substring filter over `commands`, preserving order.
 pub fn filter_commands(query: &str, commands: &[&str]) -> Vec<String> {
+    filter_command_list(query, commands)
+}
+
+pub fn filter_command_list<S: AsRef<str>>(query: &str, commands: &[S]) -> Vec<String> {
     let q = query.trim().to_lowercase();
     commands
         .iter()
+        .map(AsRef::as_ref)
         .filter(|cmd| q.is_empty() || cmd.to_lowercase().contains(&q))
-        .map(|cmd| (*cmd).to_owned())
+        .map(ToOwned::to_owned)
         .collect()
 }
 

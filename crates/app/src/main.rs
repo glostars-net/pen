@@ -14,11 +14,12 @@ use buffer::Buffer;
 use highlight::{Theme, lang_for_path, load_theme};
 use pen::disk::{DiskEvent, on_disk_change};
 use pen::editor::{CODE_SIZE, EditorState, LINE_H, editor_view_themed};
+use pen::git_guard::{CheckoutDecision, decide_checkout};
 use pen::git_panel::{
-    GitPanelState, GitSnapshot, SidebarMode, changes_section, commit_bar, diff_page_view,
-    git_dock_container, history_section, status_label,
+    GitPanelState, GitSnapshot, PendingConfirm, SidebarMode, branches_section, changes_section,
+    commit_bar, confirm_bar, diff_page_view, git_dock_container, history_section, status_label,
 };
-use pen::palette::{BUILTIN_COMMANDS, filter_commands, shortcut_hint};
+use pen::palette::{BUILTIN_COMMANDS, filter_command_list, shortcut_hint};
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, diff_highlighter, rgb_color};
 use project::watch::{ProjectWatcher, WatchEvent, watch_project_with};
 use project::{FileEntry, Project, ReadFile};
@@ -108,6 +109,14 @@ enum IoCmd {
         root: PathBuf,
         message: String,
     },
+    CheckoutBranch {
+        project: Project,
+        branch: String,
+    },
+    DiscardFile {
+        project: Project,
+        rel: PathBuf,
+    },
 }
 
 /// Answers sent back from the Tokio disk worker to `poll`.
@@ -138,6 +147,10 @@ enum IoMsg {
     DiffLoaded {
         title: String,
         patch: String,
+    },
+    WorktreeUpdated {
+        note: String,
+        entries: Vec<FileEntry>,
     },
     StatusNote(String),
     Error(String),
@@ -250,6 +263,8 @@ fn setup(s: &mut Pen, waker: Waker) {
                                 };
                                 GitSnapshot {
                                     is_repo: true,
+                                    current_branch: repo.current_branch().ok().flatten(),
+                                    branches: repo.branches().unwrap_or_default(),
                                     entries: repo.status().unwrap_or_default(),
                                     history: repo.log(50).unwrap_or_default(),
                                 }
@@ -442,6 +457,49 @@ fn setup(s: &mut Pen, waker: Waker) {
                             let _ = git_trigger_tx.try_send(refresh_root);
                             reply
                         }
+                        IoCmd::CheckoutBranch { project, branch } => {
+                            let refresh_root = project.root.clone();
+                            let reply = tokio::task::spawn_blocking(move || {
+                                let repo = pen_git::Repo::discover(&project.root)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| "Not a git repository.".to_string())?;
+                                repo.checkout(&branch).map_err(|e| e.to_string())?;
+                                let entries = project.list().map_err(|e| e.to_string())?;
+                                Ok::<_, String>((format!("Checked out {branch}."), entries))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                            .map_or_else(
+                                IoMsg::Error,
+                                |(note, entries)| IoMsg::WorktreeUpdated { note, entries },
+                            );
+                            let _ = git_trigger_tx.try_send(refresh_root);
+                            reply
+                        }
+                        IoCmd::DiscardFile { project, rel } => {
+                            let refresh_root = project.root.clone();
+                            let reply = tokio::task::spawn_blocking(move || {
+                                let repo = pen_git::Repo::discover(&project.root)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| "Not a git repository.".to_string())?;
+                                repo.discard(&rel).map_err(|e| e.to_string())?;
+                                let entries = project.list().map_err(|e| e.to_string())?;
+                                Ok::<_, String>((
+                                    format!("Discarded changes to {}.", path_to_slash(&rel)),
+                                    entries,
+                                ))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                            .map_or_else(
+                                IoMsg::Error,
+                                |(note, entries)| IoMsg::WorktreeUpdated { note, entries },
+                            );
+                            let _ = git_trigger_tx.try_send(refresh_root);
+                            reply
+                        }
                     };
                     let _ = &active_watcher;
                     if msg_tx.send(reply).await.is_err() {
@@ -622,6 +680,25 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 s.status = None;
                 tx.instant();
             }
+            IoMsg::WorktreeUpdated { note, entries } => {
+                let prev_sel = s.files.selected().next().map(str::to_owned);
+                let mut tree = build_file_tree(entries);
+                if let Some(sel) = prev_sel
+                    && tree.contains(&sel)
+                {
+                    tree.select(&sel);
+                }
+                s.files = tree;
+                if let (Some(project), Some(rel), OpenPage::Editor(ed)) =
+                    (s.project.clone(), s.active_path.clone(), &s.page)
+                    && !ed.buffer.is_dirty()
+                    && let Some(io_tx) = &s.io_tx
+                {
+                    let _ = io_tx.try_send(IoCmd::ReloadCleanFile { project, rel });
+                }
+                s.status = Some(note);
+                tx.instant();
+            }
             IoMsg::StatusNote(note) => {
                 s.status = Some(note);
                 tx.instant();
@@ -636,6 +713,68 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
 }
 
 impl Pen {
+    fn any_buffer_dirty(&self) -> bool {
+        let active_dirty = matches!(&self.page, OpenPage::Editor(ed) if ed.buffer.is_dirty());
+        active_dirty || !self.unsaved.is_empty()
+    }
+
+    fn request_checkout(&mut self, branch: String, tx: &mut Tx) {
+        if matches!(
+            decide_checkout(self.any_buffer_dirty()),
+            CheckoutDecision::KeepBuffer
+        ) {
+            self.status = Some("Changed on disk. Your copy is kept.".into());
+            tx.instant();
+            return;
+        }
+        if let (Some(project), Some(io_tx)) = (self.project.clone(), &self.io_tx) {
+            let _ = io_tx.try_send(IoCmd::CheckoutBranch { project, branch });
+        }
+    }
+
+    fn request_discard(&mut self, rel: PathBuf, tx: &mut Tx) {
+        if matches!(
+            decide_checkout(self.any_buffer_dirty()),
+            CheckoutDecision::KeepBuffer
+        ) {
+            self.status = Some("Changed on disk. Your copy is kept.".into());
+            tx.instant();
+            return;
+        }
+        self.git_panel.confirm = Some(PendingConfirm::Discard(rel));
+        tx.instant();
+    }
+
+    fn confirm_pending(&mut self, tx: &mut Tx) {
+        let Some(confirm) = self.git_panel.confirm.take() else {
+            return;
+        };
+        if matches!(
+            decide_checkout(self.any_buffer_dirty()),
+            CheckoutDecision::KeepBuffer
+        ) {
+            self.status = Some("Changed on disk. Your copy is kept.".into());
+            tx.instant();
+            return;
+        }
+        match confirm {
+            PendingConfirm::Discard(rel) => {
+                if let (Some(project), Some(io_tx)) = (self.project.clone(), &self.io_tx) {
+                    let _ = io_tx.try_send(IoCmd::DiscardFile { project, rel });
+                }
+            }
+        }
+        tx.instant();
+    }
+
+    fn palette_commands(&self) -> Vec<String> {
+        let mut cmds: Vec<String> = BUILTIN_COMMANDS.iter().map(|c| (*c).to_owned()).collect();
+        for b in &self.git_status.branches {
+            cmds.push(format!("Checkout {b}"));
+        }
+        cmds
+    }
+
     fn stash_current_if_dirty(&mut self) {
         let Some(prev) = self.active_path.take() else {
             return;
@@ -818,6 +957,19 @@ impl Pen {
                 }
             }
             "Commit" => self.open_commit_bar(tx),
+            "Discard file" => {
+                let target = self
+                    .active_path
+                    .clone()
+                    .or_else(|| self.git_panel.selected_change.clone());
+                match target {
+                    Some(rel) => self.request_discard(rel, tx),
+                    None => {
+                        self.status = Some("Select a file to discard.".into());
+                        tx.instant();
+                    }
+                }
+            }
             "Split diff" => {
                 let next = match self.diff_state.mode() {
                     DiffMode::Unified => DiffMode::Split,
@@ -846,7 +998,11 @@ impl Pen {
                 }
                 tx.instant();
             }
-            _ => {}
+            _ => {
+                if let Some(branch) = name.strip_prefix("Checkout ") {
+                    self.request_checkout(branch.to_owned(), tx);
+                }
+            }
         }
     }
 }
@@ -996,6 +1152,17 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
             |s: &mut Pen, tx: &mut Tx| s.close_commit_bar(tx),
         ));
     }
+    if let Some(confirm) = &s.git_panel.confirm {
+        page_stack = page_stack.child(confirm_bar(
+            &confirm.prompt(),
+            &theme,
+            |s: &mut Pen, tx: &mut Tx| s.confirm_pending(tx),
+            |s: &mut Pen, tx: &mut Tx| {
+                s.git_panel.confirm = None;
+                tx.instant();
+            },
+        ));
+    }
     page_stack = page_stack.child(main_surface);
     if let Some(status) = &s.status {
         page_stack = page_stack.child(
@@ -1087,6 +1254,13 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                         });
                     }
                 },
+                |s: &mut Pen, rel: PathBuf, tx: &mut Tx| s.request_discard(rel, tx),
+            );
+            let branches = branches_section(
+                &s.git_status.branches,
+                s.git_status.current_branch.as_deref(),
+                &theme,
+                |s: &mut Pen, branch: String, tx: &mut Tx| s.request_checkout(branch, tx),
             );
             let history = history_section(
                 &s.git_status.history,
@@ -1104,7 +1278,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                     tx.instant();
                 },
             );
-            git_dock_container(vec![changes, history])
+            git_dock_container(vec![changes, branches, history])
         }
     };
     let mut sidebar = col()
@@ -1274,7 +1448,8 @@ fn palette_overlay(s: &Pen, theme: &Theme) -> El {
     let faint = rgb_color(theme.faint);
     let rule = fg.alpha(0.20);
 
-    let hits = filter_commands(&s.palette_query.text, BUILTIN_COMMANDS);
+    let all_cmds = s.palette_commands();
+    let hits = filter_command_list(&s.palette_query.text, &all_cmds);
     let selected = if hits.is_empty() {
         0
     } else {
@@ -1296,7 +1471,8 @@ fn palette_overlay(s: &Pen, theme: &Theme) -> El {
             tx.instant();
         })
         .on_input_key(|s: &mut Pen, ev: &KeyEvent, tx: &mut Tx| {
-            let hits = filter_commands(&s.palette_query.text, BUILTIN_COMMANDS);
+            let all_cmds = s.palette_commands();
+            let hits = filter_command_list(&s.palette_query.text, &all_cmds);
             match ev.key {
                 Key::Escape => {
                     s.close_palette(tx);
@@ -1450,6 +1626,11 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
         return false;
+    }
+    if ev.key == Key::Escape && s.git_panel.confirm.is_some() {
+        s.git_panel.confirm = None;
+        tx.instant();
+        return true;
     }
     if ev.is_command('o') {
         s.prompt_open_folder(tx);
@@ -1627,6 +1808,8 @@ fn populate_demo_diff(s: &mut Pen, theme: &Theme) {
     s.active_path = None;
     s.git_status = GitSnapshot {
         is_repo: true,
+        current_branch: Some("main".into()),
+        branches: vec!["main".into(), "phase-2-git".into()],
         entries: vec![
             pen_git::StatusEntry {
                 rel: PathBuf::from("crates/app/src/editor.rs"),

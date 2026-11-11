@@ -20,6 +20,8 @@ pub enum GitError {
     EmptyMessage,
     #[error("Set git user.name and user.email.")]
     NoIdentity,
+    #[error("invalid reference name: {0}")]
+    InvalidRef(String),
 }
 
 pub struct Repo {
@@ -399,6 +401,152 @@ impl Repo {
         Ok(oid.to_string())
     }
 
+    /// Short name of the symbolic branch `HEAD` points at (including an unborn
+    /// branch), or `None` when `HEAD` is detached.
+    pub fn current_branch(&self) -> Result<Option<String>, GitError> {
+        Ok(self.inner.head_name()?.map(|n| n.shorten().to_string()))
+    }
+
+    /// Local branch names (`refs/heads/*`), sorted. Includes the unborn `HEAD`
+    /// branch name on a freshly initialized repository if no commits exist yet.
+    pub fn branches(&self) -> Result<Vec<String>, GitError> {
+        let refs = self.inner.references()?;
+        let iter = refs.local_branches()?;
+        let mut names = Vec::new();
+        for item in iter {
+            let r = item?;
+            names.push(r.name().shorten().to_string());
+        }
+        if names.is_empty()
+            && let Some(cur) = self.current_branch()?
+        {
+            names.push(cur);
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// Switch the worktree, index, and symbolic `HEAD` to local branch `name`.
+    pub fn checkout(&self, name: &str) -> Result<(), GitError> {
+        use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
+        use gix::refs::{FullName, Target};
+        use std::sync::atomic::AtomicBool;
+
+        let workdir = self.workdir()?.to_path_buf();
+        let full_name = FullName::try_from(format!("refs/heads/{}", name.trim()))
+            .map_err(|e| GitError::InvalidRef(e.to_string()))?;
+        let mut reference = self.inner.find_reference(&full_name)?;
+        let commit = reference.peel_to_commit()?;
+        let tree_id = commit.tree_id()?.detach();
+
+        let old_index = self.inner.index_or_empty()?;
+        let mut new_index = self.inner.index_from_tree(&tree_id)?;
+
+        // Remove tracked files present in the old index that disappear in the target tree.
+        for old_entry in old_index.entries() {
+            let rel_bstr = old_entry.path(&old_index);
+            if new_index.entry_by_path(rel_bstr).is_none()
+                && let Ok(rel_str) = std::str::from_utf8(rel_bstr.as_ref())
+            {
+                let path = workdir.join(rel_str);
+                if path.is_file() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+
+        let mut opts = self.inner.checkout_options(
+            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+        )?;
+        opts.overwrite_existing = true;
+        opts.destination_is_initially_empty = false;
+
+        let objects = self
+            .inner
+            .objects
+            .clone()
+            .into_arc()
+            .map_err(GitError::Io)?;
+        gix::worktree::state::checkout(
+            &mut new_index,
+            &workdir,
+            objects,
+            &gix::progress::Discard,
+            &gix::progress::Discard,
+            &AtomicBool::new(false),
+            opts,
+        )?;
+
+        new_index.remove_tree();
+        new_index.write(gix::index::write::Options::default())?;
+
+        let head_name =
+            FullName::try_from("HEAD").map_err(|e| GitError::InvalidRef(e.to_string()))?;
+        self.inner.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    message: format!("checkout: moving to {}", name.trim()).into(),
+                    ..Default::default()
+                },
+                expected: PreviousValue::Any,
+                new: Target::Symbolic(full_name),
+            },
+            name: head_name,
+            deref: false,
+        })?;
+        Ok(())
+    }
+
+    /// Restore `rel` in the worktree from the index (or remove an untracked
+    /// worktree file not in the index). Rejects escaping paths with
+    /// `GitError::OutsideRoot`.
+    pub fn discard(&self, rel: &Path) -> Result<(), GitError> {
+        use gix::bstr::ByteSlice;
+        use gix::index::entry::Mode;
+        use std::io::Write;
+
+        let (joined, slash) = self.checked_rel(rel)?;
+        let index = self.inner.index_or_empty()?;
+        match index.entry_by_path(slash.as_bytes().as_bstr()) {
+            Some(entry) => {
+                let bytes = self.inner.find_object(entry.id)?.detach().data;
+                if let Some(parent) = joined.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let file_name = joined
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| GitError::OutsideRoot(rel.to_path_buf()))?;
+                let tmp = joined
+                    .parent()
+                    .ok_or_else(|| GitError::OutsideRoot(rel.to_path_buf()))?
+                    .join(format!(".{file_name}.pen-discard-tmp"));
+                {
+                    let mut f = std::fs::File::create(&tmp)?;
+                    f.write_all(&bytes)?;
+                    f.sync_all()?;
+                }
+                #[cfg(unix)]
+                if entry.mode == Mode::FILE_EXECUTABLE {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+                }
+                if let Err(e) = std::fs::rename(&tmp, &joined) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(GitError::Io(e));
+                }
+                Ok(())
+            }
+            None => {
+                if joined.is_file() {
+                    std::fs::remove_file(&joined)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Line-level `(added, removed)` between the index blob at `id` and the
     /// worktree file at `root/rel`. Binary or non-UTF-8 content (either
     /// side) returns `(0, 0)`: Pen is UTF-8 only (see phase 1), and a byte
@@ -646,6 +794,63 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].summary, "add note");
         assert!(oid.starts_with(&log[0].id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discard_restores_from_index_and_rejects_escape() {
+        let dir = std::env::temp_dir().join(format!("pen-git-discard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "clean\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(matches!(
+            repo.discard(std::path::Path::new("../outside")),
+            Err(GitError::OutsideRoot(_))
+        ));
+        repo.discard(std::path::Path::new("a.txt")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "clean\n"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn branches_and_checkout_switches_worktree() {
+        let dir = std::env::temp_dir().join(format!("pen-git-checkout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("v.txt"), "on-main\n").unwrap();
+        git(&dir, &["add", "v.txt"]);
+        git(&dir, &["commit", "-q", "-m", "main commit"]);
+
+        git(&dir, &["checkout", "-q", "-b", "topic"]);
+        std::fs::write(dir.join("v.txt"), "on-topic\n").unwrap();
+        std::fs::write(dir.join("only-topic.txt"), "extra\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "topic commit"]);
+
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        let branches = repo.branches().unwrap();
+        assert_eq!(branches, vec!["main".to_string(), "topic".to_string()]);
+        repo.checkout("main").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("v.txt")).unwrap(),
+            "on-main\n"
+        );
+        assert!(!dir.join("only-topic.txt").exists());
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert_eq!(repo.current_branch().unwrap().as_deref(), Some("main"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

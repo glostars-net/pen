@@ -23,6 +23,27 @@ pub enum SidebarMode {
     Git,
 }
 
+/// Destructive action awaiting explicit confirmation from the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingConfirm {
+    Discard(PathBuf),
+}
+
+impl PendingConfirm {
+    pub fn prompt(&self) -> String {
+        match self {
+            PendingConfirm::Discard(rel) => {
+                let name = rel
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| rel_display(rel));
+                format!("Discard changes to {name}?")
+            }
+        }
+    }
+}
+
 /// UI state owned by the Git panel.
 #[derive(Debug, Default)]
 pub struct GitPanelState {
@@ -31,6 +52,7 @@ pub struct GitPanelState {
     pub selected_commit: Option<String>,
     pub commit_open: bool,
     pub commit_message: TextEdit,
+    pub confirm: Option<PendingConfirm>,
 }
 
 /// The latest known git state, or default/empty when the project isn't a git
@@ -38,6 +60,8 @@ pub struct GitPanelState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitSnapshot {
     pub is_repo: bool,
+    pub current_branch: Option<String>,
+    pub branches: Vec<String>,
     pub entries: Vec<pen_git::StatusEntry>,
     pub history: Vec<pen_git::CommitSummary>,
 }
@@ -62,13 +86,14 @@ fn rel_display(rel: &std::path::Path) -> String {
 }
 
 /// Render the `"Changes"` section at the top of the Git dock (Zed-style):
-/// clicking a row opens its unstaged diff; `+` stages that file directly.
+/// clicking a row opens its unstaged diff; `+` stages, `↺` prompts discard.
 pub fn changes_section<S: 'static>(
     entries: &[pen_git::StatusEntry],
     selected: Option<&std::path::Path>,
     theme: &Theme,
     on_select: impl Fn(&mut S, PathBuf, &mut Tx) + Clone + 'static,
     on_stage: impl Fn(&mut S, PathBuf, &mut Tx) + Clone + 'static,
+    on_discard: impl Fn(&mut S, PathBuf, &mut Tx) + Clone + 'static,
 ) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
@@ -148,6 +173,22 @@ pub fn changes_section<S: 'static>(
         if !lbl.is_empty() {
             item = item.child(text(lbl).font(count_font).color(faint));
         }
+        let discard_rel = entry.rel.clone();
+        let discard_cb = on_discard.clone();
+        let discard_btn = row()
+            .key(format!("pen/discard-{slash}"))
+            .role("button")
+            .label(format!("Discard {slash}"))
+            .focusable(true)
+            .h(20.0)
+            .px(6.0)
+            .radius(4.0)
+            .center_y()
+            .cursor(Cursor::Pointer)
+            .hover(fg.alpha(0.10))
+            .transition(Transition::none())
+            .on_press_tx(move |s: &mut S, tx: &mut Tx| discard_cb(s, discard_rel.clone(), tx))
+            .child(text("↺").font(UI_FONT).color(faint));
         let stage_rel = entry.rel.clone();
         let stage_cb = on_stage.clone();
         let stage_btn = row()
@@ -164,10 +205,148 @@ pub fn changes_section<S: 'static>(
             .transition(Transition::none())
             .on_press_tx(move |s: &mut S, tx: &mut Tx| stage_cb(s, stage_rel.clone(), tx))
             .child(text("+").font(UI_MEDIUM_FONT).color(faint));
-        item = item.child(stage_btn);
+        item = item.child(discard_btn).child(stage_btn);
         list = list.child(item);
     }
     section.child(list)
+}
+
+/// Render the `"Branches"` section inside the Git dock: clicking an inactive
+/// branch checks it out (guarded by `decide_checkout` in the app).
+pub fn branches_section<S: 'static>(
+    branches: &[String],
+    current: Option<&str>,
+    theme: &Theme,
+    on_checkout: impl Fn(&mut S, String, &mut Tx) + Clone + 'static,
+) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+
+    let mut section = col().key("pen/git-branches").w_full().gap(2.0);
+    section = section.child(
+        row()
+            .key("pen/git-branches-head")
+            .w_full()
+            .h(24.0)
+            .px(8.0)
+            .center_y()
+            .child(text("Branches").font(UI_MEDIUM_FONT).color(faint)),
+    );
+
+    if branches.is_empty() {
+        return section.child(
+            row()
+                .key("pen/git-branches-empty")
+                .w_full()
+                .h(28.0)
+                .px(8.0)
+                .center_y()
+                .child(text("No branches yet").font(UI_FONT).color(faint)),
+        );
+    }
+
+    let mut list = col().key("pen/git-branches-rows").w_full().gap(1.0);
+    for branch in branches {
+        let is_current = current == Some(branch.as_str());
+        let b_owned = branch.clone();
+        let cb = on_checkout.clone();
+        let mut item = row()
+            .key(format!("pen/branch-{branch}"))
+            .role("option")
+            .label(branch.clone())
+            .focusable(true)
+            .w_full()
+            .h(28.0)
+            .px(8.0)
+            .gap(8.0)
+            .radius(6.0)
+            .center_y()
+            .cursor(Cursor::Pointer)
+            .fill(if is_current { fg.alpha(0.08) } else { bg })
+            .hover(fg.alpha(0.06))
+            .transition(Transition::none())
+            .on_press_tx(move |s: &mut S, tx: &mut Tx| cb(s, b_owned.clone(), tx))
+            .child(
+                text(branch.clone())
+                    .font(if is_current { UI_MEDIUM_FONT } else { UI_FONT })
+                    .color(fg)
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0)
+                    .truncate(),
+            );
+        if is_current {
+            item = item.child(text("current").font(UI_FONT).color(faint));
+        }
+        list = list.child(item);
+    }
+    section.child(list)
+}
+
+/// Single-line inline confirmation bar pinned above the page (never a modal
+/// dialog stack). Declining leaves worktree and buffers untouched.
+pub fn confirm_bar<S: 'static>(
+    prompt: &str,
+    theme: &Theme,
+    on_confirm: impl Fn(&mut S, &mut Tx) + 'static,
+    on_cancel: impl Fn(&mut S, &mut Tx) + 'static,
+) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let rule = fg.alpha(0.20);
+
+    row()
+        .key("pen/confirm-bar")
+        .w_full()
+        .h(36.0)
+        .px(16.0)
+        .gap(10.0)
+        .center_y()
+        .fill(bg)
+        .border_sides([0.0, 0.0, 1.0, 0.0], rule)
+        .transition(Transition::none())
+        .child(
+            text(prompt.to_owned())
+                .font(UI_FONT)
+                .color(fg)
+                .grow(1.0)
+                .truncate(),
+        )
+        .child(
+            row()
+                .key("pen/confirm-yes")
+                .role("button")
+                .label("Confirm")
+                .focusable(true)
+                .h(24.0)
+                .px(10.0)
+                .radius(6.0)
+                .center()
+                .cursor(Cursor::Pointer)
+                .border(1.0, rule)
+                .hover(fg.alpha(0.08))
+                .transition(Transition::none())
+                .on_press_tx(on_confirm)
+                .child(text("Confirm").font(UI_MEDIUM_FONT).color(fg)),
+        )
+        .child(
+            row()
+                .key("pen/confirm-no")
+                .role("button")
+                .label("Cancel")
+                .focusable(true)
+                .h(24.0)
+                .px(10.0)
+                .radius(6.0)
+                .center()
+                .cursor(Cursor::Pointer)
+                .hover(fg.alpha(0.06))
+                .transition(Transition::none())
+                .on_press_tx(on_cancel)
+                .child(text("Cancel").font(UI_FONT).color(faint)),
+        )
 }
 
 /// Single-line commit bar pinned directly above the page (same pattern as Find
