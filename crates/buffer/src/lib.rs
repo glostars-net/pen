@@ -155,6 +155,32 @@ impl Buffer {
         self.dirty = false;
     }
 
+    /// Literal case-sensitive scalar search starting at `from_char`, wrapping
+    /// once around the top of the buffer. No regex.
+    pub fn find_next(&self, from_char: usize, query: &str) -> Option<std::ops::Range<usize>> {
+        if query.is_empty() {
+            return None;
+        }
+        let qlen = query.chars().count();
+        let len = self.rope.len_chars();
+        let from = from_char.min(len);
+
+        let tail: String = self.rope.slice(from..len).into();
+        if let Some(byte_idx) = tail.find(query) {
+            let start = from + tail[..byte_idx].chars().count();
+            return Some(start..start + qlen);
+        }
+        if from > 0 {
+            let head_end = (from + qlen.saturating_sub(1)).min(len);
+            let head: String = self.rope.slice(0..head_end).into();
+            if let Some(byte_idx) = head.find(query) {
+                let start = head[..byte_idx].chars().count();
+                return Some(start..start + qlen);
+            }
+        }
+        None
+    }
+
     /// Applies an edit to the rope and returns its inverse.
     fn apply(&mut self, edit: Edit) -> Edit {
         match edit {
@@ -259,6 +285,12 @@ mod tests {
         let took = start.elapsed();
         println!("10 MB from_reader: {took:?} ({} lines)", b.len_lines());
         assert!(took.as_millis() < 100, "10 MB open took {took:?}, budget is 100 ms");
+    }
+
+    #[test]
+    fn find_next_is_char_indexed() {
+        let b = Buffer::from_str("éé needle");
+        assert_eq!(b.find_next(0, "needle"), Some(3..9));
     }
 
     #[test]

@@ -413,6 +413,25 @@ impl EditorState {
         Some(out)
     }
 
+    /// Select the next occurrence of `query` from the caret (or from the start
+    /// of the current selection when typing into Find). Returns true on match.
+    pub fn find_and_select(&mut self, query: &str, step_past_current: bool) -> bool {
+        if query.is_empty() {
+            self.anchor = self.caret;
+            return false;
+        }
+        let start = if step_past_current {
+            self.selection().map_or(self.caret, |r| (r.start + 1).min(self.buffer.len_chars()))
+        } else {
+            self.selection().map_or(self.caret, |r| r.start)
+        };
+        let Some(hit) = self.buffer.find_next(start, query) else { return false };
+        self.anchor = hit.start;
+        self.caret = hit.end;
+        self.reveal_caret();
+        true
+    }
+
     fn delete_selection(&mut self) -> bool {
         let Some(sel) = self.selection() else { return false };
         let start = sel.start;
