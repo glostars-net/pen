@@ -6,6 +6,8 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "Open folder",
     "Save",
     "Find",
+    "Stage file",
+    "Commit",
     "Split diff",
     "Use Ink",
     "Use Paper",

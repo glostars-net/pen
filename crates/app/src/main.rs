@@ -15,8 +15,8 @@ use highlight::{Theme, lang_for_path, load_theme};
 use pen::disk::{DiskEvent, on_disk_change};
 use pen::editor::{CODE_SIZE, EditorState, LINE_H, editor_view_themed};
 use pen::git_panel::{
-    GitPanelState, GitSnapshot, SidebarMode, changes_section, diff_page_view, git_dock_container,
-    history_section, status_label,
+    GitPanelState, GitSnapshot, SidebarMode, changes_section, commit_bar, diff_page_view,
+    git_dock_container, history_section, status_label,
 };
 use pen::palette::{BUILTIN_COMMANDS, filter_commands, shortcut_hint};
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, diff_highlighter, rgb_color};
@@ -100,6 +100,14 @@ enum IoCmd {
         root: PathBuf,
         id: String,
     },
+    StageFile {
+        root: PathBuf,
+        rel: PathBuf,
+    },
+    Commit {
+        root: PathBuf,
+        message: String,
+    },
 }
 
 /// Answers sent back from the Tokio disk worker to `poll`.
@@ -131,6 +139,7 @@ enum IoMsg {
         title: String,
         patch: String,
     },
+    StatusNote(String),
     Error(String),
 }
 
@@ -400,6 +409,39 @@ fn setup(s: &mut Pen, waker: Waker) {
                             title,
                             patch,
                         }),
+                        IoCmd::StageFile { root, rel } => {
+                            let refresh_root = root.clone();
+                            let reply = tokio::task::spawn_blocking(move || {
+                                let repo = pen_git::Repo::discover(&root)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| "Not a git repository.".to_string())?;
+                                repo.stage(&rel).map_err(|e| e.to_string())?;
+                                Ok::<_, String>(format!("Staged {}.", path_to_slash(&rel)))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                            .map_or_else(IoMsg::Error, IoMsg::StatusNote);
+                            let _ = git_trigger_tx.try_send(refresh_root);
+                            reply
+                        }
+                        IoCmd::Commit { root, message } => {
+                            let refresh_root = root.clone();
+                            let reply = tokio::task::spawn_blocking(move || {
+                                let repo = pen_git::Repo::discover(&root)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| "Not a git repository.".to_string())?;
+                                let oid = repo.commit(&message).map_err(|e| e.to_string())?;
+                                let short: String = oid.chars().take(7).collect();
+                                Ok::<_, String>(format!("Committed {short}."))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                            .map_or_else(IoMsg::Error, IoMsg::StatusNote);
+                            let _ = git_trigger_tx.try_send(refresh_root);
+                            reply
+                        }
                     };
                     let _ = &active_watcher;
                     if msg_tx.send(reply).await.is_err() {
@@ -580,6 +622,10 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 s.status = None;
                 tx.instant();
             }
+            IoMsg::StatusNote(note) => {
+                s.status = Some(note);
+                tx.instant();
+            }
             IoMsg::Error(err) => {
                 s.status = Some(err);
                 tx.instant();
@@ -697,9 +743,52 @@ impl Pen {
         self.find_query.focused = false;
         tx.blur();
         if let OpenPage::Editor(ed) = &mut self.page {
-            ed.focused = true;
+            ed.focused = !self.git_panel.commit_open;
         }
         tx.instant();
+    }
+
+    fn open_commit_bar(&mut self, tx: &mut Tx) {
+        self.palette_open = false;
+        self.palette_query.focused = false;
+        self.git_panel.commit_open = true;
+        self.git_panel.commit_message.focused = true;
+        if let OpenPage::Editor(ed) = &mut self.page {
+            ed.focused = false;
+        }
+        tx.instant();
+    }
+
+    fn close_commit_bar(&mut self, tx: &mut Tx) {
+        self.git_panel.commit_open = false;
+        self.git_panel.commit_message.focused = false;
+        tx.blur();
+        if let OpenPage::Editor(ed) = &mut self.page {
+            ed.focused = !self.find_open;
+        }
+        tx.instant();
+    }
+
+    fn submit_commit(&mut self, tx: &mut Tx) {
+        let message = self.git_panel.commit_message.text.clone();
+        if message.trim().is_empty() {
+            self.status = Some("Commit message cannot be empty.".into());
+            tx.instant();
+            return;
+        }
+        let Some(proj) = &self.project else {
+            self.status = Some("Open a folder first.".into());
+            tx.instant();
+            return;
+        };
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::Commit {
+                root: proj.root.clone(),
+                message,
+            });
+        }
+        self.git_panel.commit_message.clear();
+        self.close_commit_bar(tx);
     }
 
     fn run_command(&mut self, name: &str, tx: &mut Tx) {
@@ -710,6 +799,25 @@ impl Pen {
                 self.request_save();
             }
             "Find" => self.open_find(tx),
+            "Stage file" => {
+                let target = self
+                    .active_path
+                    .clone()
+                    .or_else(|| self.git_panel.selected_change.clone());
+                match (&self.project, target, &self.io_tx) {
+                    (Some(proj), Some(rel), Some(io_tx)) => {
+                        let _ = io_tx.try_send(IoCmd::StageFile {
+                            root: proj.root.clone(),
+                            rel,
+                        });
+                    }
+                    _ => {
+                        self.status = Some("Select a file to stage.".into());
+                        tx.instant();
+                    }
+                }
+            }
+            "Commit" => self.open_commit_bar(tx),
             "Split diff" => {
                 let next = match self.diff_state.mode() {
                     DiffMode::Unified => DiffMode::Split,
@@ -879,6 +987,15 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     if s.find_open {
         page_stack = page_stack.child(find_bar(s, &theme));
     }
+    if s.git_panel.commit_open {
+        page_stack = page_stack.child(commit_bar(
+            &s.git_panel.commit_message,
+            &theme,
+            |s: &mut Pen| &mut s.git_panel.commit_message,
+            |s: &mut Pen, tx: &mut Tx| s.submit_commit(tx),
+            |s: &mut Pen, tx: &mut Tx| s.close_commit_bar(tx),
+        ));
+    }
     page_stack = page_stack.child(main_surface);
     if let Some(status) = &s.status {
         page_stack = page_stack.child(
@@ -961,6 +1078,14 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                         });
                     }
                     tx.instant();
+                },
+                |s: &mut Pen, rel: PathBuf, _tx: &mut Tx| {
+                    if let (Some(proj), Some(io_tx)) = (&s.project, &s.io_tx) {
+                        let _ = io_tx.try_send(IoCmd::StageFile {
+                            root: proj.root.clone(),
+                            rel,
+                        });
+                    }
                 },
             );
             let history = history_section(

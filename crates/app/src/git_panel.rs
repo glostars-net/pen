@@ -6,11 +6,14 @@
 use std::path::PathBuf;
 
 use highlight::Theme;
-use rune::{Cursor, El, ScrollSpec, TextStyle, Transition, Tx, col, row, text};
+use rune::{
+    Cursor, El, Key, KeyEvent, ScrollSpec, TextEdit, TextStyle, Transition, Tx, col, row, text,
+    text_input,
+};
 use rune_kit::Kit;
 use rune_kit::diff::{DiffMode, DiffState, DiffView};
 
-use crate::theme_kit::{UI_FONT, UI_MEDIUM_FONT, rgb_color};
+use crate::theme_kit::{MONO_UI_FONT, UI_FONT, UI_MEDIUM_FONT, rgb_color};
 
 /// Which dock tab is active inside Pen's left sidebar (Zed-style Files / Git).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -26,6 +29,8 @@ pub struct GitPanelState {
     pub mode: SidebarMode,
     pub selected_change: Option<PathBuf>,
     pub selected_commit: Option<String>,
+    pub commit_open: bool,
+    pub commit_message: TextEdit,
 }
 
 /// The latest known git state, or default/empty when the project isn't a git
@@ -57,12 +62,13 @@ fn rel_display(rel: &std::path::Path) -> String {
 }
 
 /// Render the `"Changes"` section at the top of the Git dock (Zed-style):
-/// clicking a row opens its unstaged diff in the main page.
+/// clicking a row opens its unstaged diff; `+` stages that file directly.
 pub fn changes_section<S: 'static>(
     entries: &[pen_git::StatusEntry],
     selected: Option<&std::path::Path>,
     theme: &Theme,
     on_select: impl Fn(&mut S, PathBuf, &mut Tx) + Clone + 'static,
+    on_stage: impl Fn(&mut S, PathBuf, &mut Tx) + Clone + 'static,
 ) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
@@ -131,7 +137,7 @@ pub fn changes_section<S: 'static>(
             .transition(Transition::none())
             .on_press_tx(move |s: &mut S, tx: &mut Tx| cb(s, rel_owned.clone(), tx))
             .child(
-                text(slash)
+                text(slash.clone())
                     .font(UI_FONT)
                     .color(fg)
                     .grow(1.0)
@@ -142,9 +148,109 @@ pub fn changes_section<S: 'static>(
         if !lbl.is_empty() {
             item = item.child(text(lbl).font(count_font).color(faint));
         }
+        let stage_rel = entry.rel.clone();
+        let stage_cb = on_stage.clone();
+        let stage_btn = row()
+            .key(format!("pen/stage-{slash}"))
+            .role("button")
+            .label(format!("Stage {slash}"))
+            .focusable(true)
+            .h(20.0)
+            .px(6.0)
+            .radius(4.0)
+            .center_y()
+            .cursor(Cursor::Pointer)
+            .hover(fg.alpha(0.10))
+            .transition(Transition::none())
+            .on_press_tx(move |s: &mut S, tx: &mut Tx| stage_cb(s, stage_rel.clone(), tx))
+            .child(text("+").font(UI_MEDIUM_FONT).color(faint));
+        item = item.child(stage_btn);
         list = list.child(item);
     }
     section.child(list)
+}
+
+/// Single-line commit bar pinned directly above the page (same pattern as Find
+/// in phase 1 — no dialog stack). `Enter` submits, `Escape` closes.
+pub fn commit_bar<S: 'static>(
+    message: &TextEdit,
+    theme: &Theme,
+    edit_field: impl Fn(&mut S) -> &mut TextEdit + 'static,
+    on_submit: impl Fn(&mut S, &mut Tx) + Clone + 'static,
+    on_close: impl Fn(&mut S, &mut Tx) + Clone + 'static,
+) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let rule = fg.alpha(0.20);
+    let submit_key = on_submit.clone();
+    let close_key = on_close.clone();
+
+    let input = text_input(message, MONO_UI_FONT)
+        .key("pen/commit-input")
+        .label("Commit message")
+        .single_line()
+        .placeholder("Commit message", faint)
+        .color(fg)
+        .caret(fg, fg.alpha(0.12))
+        .grow(1.0)
+        .h(20.0)
+        .on_edit(edit_field)
+        .on_input_key(move |s: &mut S, ev: &KeyEvent, tx: &mut Tx| match ev.key {
+            Key::Escape => {
+                close_key(s, tx);
+                true
+            }
+            Key::Enter => {
+                submit_key(s, tx);
+                true
+            }
+            _ => false,
+        });
+
+    row()
+        .key("pen/commit-bar")
+        .w_full()
+        .h(36.0)
+        .px(16.0)
+        .gap(12.0)
+        .center_y()
+        .fill(bg)
+        .border_sides([0.0, 0.0, 1.0, 0.0], rule)
+        .transition(Transition::none())
+        .child(input)
+        .child(
+            row()
+                .key("pen/commit-submit")
+                .role("button")
+                .label("Commit")
+                .focusable(true)
+                .h(24.0)
+                .px(10.0)
+                .radius(6.0)
+                .center()
+                .cursor(Cursor::Pointer)
+                .border(1.0, rule)
+                .hover(fg.alpha(0.06))
+                .transition(Transition::none())
+                .on_press_tx(on_submit)
+                .child(text("Commit").font(UI_FONT).color(fg)),
+        )
+        .child(
+            row()
+                .key("pen/commit-close")
+                .role("button")
+                .label("Close commit")
+                .focusable(true)
+                .size(24.0, 24.0)
+                .radius(6.0)
+                .center()
+                .cursor(Cursor::Pointer)
+                .hover(fg.alpha(0.06))
+                .transition(Transition::none())
+                .on_press_tx(on_close)
+                .child(text("×").font(UI_FONT).color(faint)),
+        )
 }
 
 /// Render the History list inside the Git panel. Each row shows the commit's

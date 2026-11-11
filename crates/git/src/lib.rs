@@ -16,6 +16,10 @@ pub enum GitError {
     OutsideRoot(PathBuf),
     #[error("bare repository has no worktree")]
     BareRepository,
+    #[error("commit message cannot be empty")]
+    EmptyMessage,
+    #[error("Set git user.name and user.email.")]
+    NoIdentity,
 }
 
 pub struct Repo {
@@ -287,6 +291,114 @@ impl Repo {
         Ok(out)
     }
 
+    /// Stage `rel` into the repository index (adding/updating its blob when
+    /// present on disk, or removing the index entry when deleted on disk).
+    /// Rejects escaping paths with `GitError::OutsideRoot`.
+    pub fn stage(&self, rel: &Path) -> Result<(), GitError> {
+        use gix::bstr::ByteSlice;
+        use gix::index::entry::{Flags, Mode, Stage, Stat};
+
+        let (joined, slash) = self.checked_rel(rel)?;
+        let mut index = match self.inner.open_index() {
+            Ok(file) => file,
+            Err(_) => gix::index::File::from_state(
+                gix::index::State::new(self.inner.object_hash()),
+                self.inner.index_path(),
+            ),
+        };
+        index.remove_entries(|_, path, _| path == slash.as_bytes().as_bstr());
+
+        if let Ok(fs_meta) = gix::index::fs::Metadata::from_path_no_follow(&joined) {
+            let mode = if fs_meta.is_symlink() {
+                Mode::SYMLINK
+            } else if fs_meta.is_executable() {
+                Mode::FILE_EXECUTABLE
+            } else {
+                Mode::FILE
+            };
+            let blob_bytes = if fs_meta.is_symlink() {
+                std::fs::read_link(&joined)?
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_bytes()
+            } else {
+                std::fs::read(&joined)?
+            };
+            let blob_id = self.inner.write_blob(&blob_bytes)?.detach();
+            let stat = Stat::from_fs(&fs_meta).unwrap_or_default();
+            index.dangerously_push_entry(
+                stat,
+                blob_id,
+                Flags::from_stage(Stage::Unconflicted),
+                mode,
+                slash.as_bytes().as_bstr(),
+            );
+            index.sort_entries();
+        }
+
+        index.remove_tree();
+        index.write(gix::index::write::Options::default())?;
+        Ok(())
+    }
+
+    /// Write a commit on `HEAD` from the current index using `message` and the
+    /// repository's configured author/committer identity. Blank messages
+    /// return `GitError::EmptyMessage`; missing `user.name` or `user.email`
+    /// returns `GitError::NoIdentity`.
+    pub fn commit(&self, message: &str) -> Result<String, GitError> {
+        use gix::bstr::ByteSlice;
+        use gix::index::entry::{Mode, Stage};
+        use gix::object::tree::EntryKind;
+
+        if message.trim().is_empty() {
+            return Err(GitError::EmptyMessage);
+        }
+        let author = self.inner.author().ok_or(GitError::NoIdentity)??;
+        let committer = self.inner.committer().ok_or(GitError::NoIdentity)??;
+        if author.name.trim().is_empty()
+            || author.email.trim().is_empty()
+            || committer.name.trim().is_empty()
+            || committer.email.trim().is_empty()
+        {
+            return Err(GitError::NoIdentity);
+        }
+
+        let index = self.inner.index_or_empty()?;
+        let empty = self.inner.empty_tree();
+        let mut editor = empty.edit()?;
+        for entry in index.entries() {
+            if entry.stage() != Stage::Unconflicted {
+                continue;
+            }
+            let kind = match entry.mode {
+                Mode::FILE => EntryKind::Blob,
+                Mode::FILE_EXECUTABLE => EntryKind::BlobExecutable,
+                Mode::SYMLINK => EntryKind::Link,
+                Mode::COMMIT => EntryKind::Commit,
+                _ => continue,
+            };
+            let path = entry.path(&index);
+            editor.upsert(path, kind, entry.id)?;
+        }
+        let tree_id = editor.write()?.detach();
+
+        let head = self.inner.head()?;
+        let parents: Vec<gix::ObjectId> = if head.is_unborn() {
+            Vec::new()
+        } else {
+            vec![head.into_peeled_id()?.detach()]
+        };
+        let mut msg = message.to_owned();
+        if !msg.ends_with('\n') {
+            msg.push('\n');
+        }
+        let oid = self
+            .inner
+            .commit_as(committer, author, "HEAD", &msg, tree_id, parents)?
+            .detach();
+        Ok(oid.to_string())
+    }
+
     /// Line-level `(added, removed)` between the index blob at `id` and the
     /// worktree file at `root/rel`. Binary or non-UTF-8 content (either
     /// side) returns `(0, 0)`: Pen is UTF-8 only (see phase 1), and a byte
@@ -480,6 +592,60 @@ mod tests {
         assert!(commit_patch.contains("diff --git a/lib.rs b/lib.rs"));
         assert!(commit_patch.contains("-    1"));
         assert!(commit_patch.contains("+    2"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_rejects_blank_message() {
+        let dir = std::env::temp_dir().join(format!("pen-git-commit-blank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(matches!(repo.commit("  "), Err(GitError::EmptyMessage)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stage_rejects_parent_escape() {
+        let dir = std::env::temp_dir().join(format!("pen-git-stage-esc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(matches!(
+            repo.stage(std::path::Path::new("../x")),
+            Err(GitError::OutsideRoot(_))
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stage_and_commit_records_commit_in_log() {
+        let dir = std::env::temp_dir().join(format!("pen-git-stage-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.name", "Ada"]);
+        git(&dir, &["config", "user.email", "ada@example.com"]);
+
+        std::fs::write(dir.join("note.txt"), "hello pen\n").unwrap();
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        repo.stage(std::path::Path::new("note.txt")).unwrap();
+        let oid = repo.commit("add note").unwrap();
+        assert!(oid.len() >= 40);
+
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        assert!(repo.status().unwrap().is_empty());
+        let log = repo.log(5).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].summary, "add note");
+        assert!(oid.starts_with(&log[0].id));
 
         std::fs::remove_dir_all(&dir).ok();
     }
