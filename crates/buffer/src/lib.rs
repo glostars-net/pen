@@ -18,6 +18,14 @@ enum Edit {
     Delete { at: usize, len: usize },
 }
 
+/// One visible line, for the editor's viewport. Only the lines on screen are
+/// ever turned into `String`s; the rest of the file stays in the rope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineSlice {
+    pub line_idx: usize,
+    pub text: String,
+}
+
 /// A text buffer on a rope, with inverse-edit undo. No grouping: one edit,
 /// one entry.
 pub struct Buffer {
@@ -31,6 +39,20 @@ impl Buffer {
     #[allow(clippy::should_implement_trait)] // the plan's constructor name; not `FromStr`, which parses
     pub fn from_str(text: &str) -> Self {
         Buffer { rope: ropey::Rope::from_str(text), undo: VecDeque::new(), redo: Vec::new(), dirty: false }
+    }
+
+    /// Read a whole file. Clean (not dirty), empty undo. UTF-8 only: bytes
+    /// that aren't valid UTF-8 are an error, as are read failures.
+    pub fn from_reader(reader: impl std::io::Read) -> Result<Self, std::io::Error> {
+        let rope = ropey::Rope::from_reader(reader)?;
+        Ok(Buffer { rope, undo: VecDeque::new(), redo: Vec::new(), dirty: false })
+    }
+
+    /// At most `count` lines starting at `first_line`, fewer at end of file.
+    /// Walks only the requested range; it never shapes or copies the file.
+    pub fn viewport(&self, first_line: usize, count: usize) -> Vec<LineSlice> {
+        let end = (first_line + count).min(self.len_lines());
+        (first_line..end).map(|line_idx| LineSlice { line_idx, text: self.line(line_idx) }).collect()
     }
 
     /// Insert `text` at a char index. Pushes one undo entry and clears redo.
@@ -159,6 +181,43 @@ mod tests {
         assert!(b.undo());
         assert_eq!(b.text(), "a");
         assert!(b.is_dirty());
+    }
+
+    #[test]
+    fn viewport_does_not_return_the_whole_file() {
+        let mut raw = String::new();
+        for i in 0..10_000 {
+            raw.push_str(&format!("line {i}\n"));
+        }
+        let b = Buffer::from_str(&raw);
+        let window = b.viewport(100, 40);
+        assert_eq!(window.len(), 40);
+        assert_eq!(window[0].line_idx, 100);
+        assert_eq!(window[0].text, "line 100");
+    }
+
+    #[test]
+    fn from_reader_matches_from_str() {
+        let b = Buffer::from_reader("a\nb".as_bytes()).unwrap();
+        assert_eq!(b.text(), "a\nb");
+        assert!(!b.is_dirty());
+    }
+
+    /// The large-file budget from the plan: a 10 MB open finishes under
+    /// 100 ms. Run in release: `cargo test -p buffer --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "release-only budget test"]
+    fn ten_megabyte_open_is_under_100ms() {
+        let line = "let value = compute(input, options); // a plausible line of code\n";
+        let mut raw = String::with_capacity(10 * 1024 * 1024 + line.len());
+        while raw.len() < 10 * 1024 * 1024 {
+            raw.push_str(line);
+        }
+        let start = std::time::Instant::now();
+        let b = Buffer::from_reader(raw.as_bytes()).unwrap();
+        let took = start.elapsed();
+        println!("10 MB from_reader: {took:?} ({} lines)", b.len_lines());
+        assert!(took.as_millis() < 100, "10 MB open took {took:?}, budget is 100 ms");
     }
 
     #[test]
