@@ -18,6 +18,7 @@ use pen::git_guard::{CheckoutDecision, decide_checkout};
 use pen::git_panel::{
     GitPanelState, GitSnapshot, PendingConfirm, SidebarMode, branches_section, changes_section,
     commit_bar, confirm_bar, diff_page_view, git_dock_container, history_section, status_label,
+    worktrees_section,
 };
 use pen::palette::{BUILTIN_COMMANDS, filter_command_list, shortcut_hint};
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, diff_highlighter, rgb_color};
@@ -116,6 +117,15 @@ enum IoCmd {
     DiscardFile {
         project: Project,
         rel: PathBuf,
+    },
+    AddWorktree {
+        root: PathBuf,
+        path: PathBuf,
+        branch: String,
+    },
+    RemoveWorktree {
+        root: PathBuf,
+        path: PathBuf,
     },
 }
 
@@ -267,6 +277,7 @@ fn setup(s: &mut Pen, waker: Waker) {
                                     branches: repo.branches().unwrap_or_default(),
                                     entries: repo.status().unwrap_or_default(),
                                     history: repo.log(50).unwrap_or_default(),
+                                    worktrees: repo.worktrees().unwrap_or_default(),
                                 }
                             })
                             .await
@@ -497,6 +508,42 @@ fn setup(s: &mut Pen, waker: Waker) {
                                 IoMsg::Error,
                                 |(note, entries)| IoMsg::WorktreeUpdated { note, entries },
                             );
+                            let _ = git_trigger_tx.try_send(refresh_root);
+                            reply
+                        }
+                        IoCmd::AddWorktree { root, path, branch } => {
+                            let refresh_root = root.clone();
+                            let reply = tokio::task::spawn_blocking(move || {
+                                let repo = pen_git::Repo::discover(&root)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| "Not a git repository.".to_string())?;
+                                repo.add_worktree(&path, &branch)
+                                    .map_err(|e| e.to_string())?;
+                                Ok::<_, String>(format!(
+                                    "Added worktree {} ({branch}).",
+                                    path.display()
+                                ))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                            .map_or_else(IoMsg::Error, IoMsg::StatusNote);
+                            let _ = git_trigger_tx.try_send(refresh_root);
+                            reply
+                        }
+                        IoCmd::RemoveWorktree { root, path } => {
+                            let refresh_root = root.clone();
+                            let reply = tokio::task::spawn_blocking(move || {
+                                let repo = pen_git::Repo::discover(&root)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| "Not a git repository.".to_string())?;
+                                repo.remove_worktree(&path).map_err(|e| e.to_string())?;
+                                Ok::<_, String>(format!("Removed worktree {}.", path.display()))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                            .map_or_else(IoMsg::Error, IoMsg::StatusNote);
                             let _ = git_trigger_tx.try_send(refresh_root);
                             reply
                         }
@@ -745,6 +792,71 @@ impl Pen {
         tx.instant();
     }
 
+    fn request_remove_worktree(&mut self, path: PathBuf, tx: &mut Tx) {
+        if matches!(
+            decide_checkout(self.any_buffer_dirty()),
+            CheckoutDecision::KeepBuffer
+        ) {
+            self.status = Some("Changed on disk. Your copy is kept.".into());
+            tx.instant();
+            return;
+        }
+        self.git_panel.confirm = Some(PendingConfirm::RemoveWorktree(path));
+        tx.instant();
+    }
+
+    fn toggle_add_worktree(&mut self, tx: &mut Tx) {
+        self.git_panel.add_worktree_open = !self.git_panel.add_worktree_open;
+        if self.git_panel.add_worktree_open {
+            self.git_panel.mode = SidebarMode::Git;
+            if !self.sidebar.is_open() {
+                self.sidebar.toggle();
+            }
+            self.git_panel.worktree_path.focused = true;
+            if let OpenPage::Editor(ed) = &mut self.page {
+                ed.focused = false;
+            }
+        } else {
+            self.git_panel.worktree_path.focused = false;
+            self.git_panel.worktree_branch.focused = false;
+            tx.blur();
+            if let OpenPage::Editor(ed) = &mut self.page {
+                ed.focused = !self.find_open && !self.git_panel.commit_open;
+            }
+        }
+        tx.instant();
+    }
+
+    fn submit_add_worktree(&mut self, tx: &mut Tx) {
+        let path_raw = self.git_panel.worktree_path.text.trim().to_owned();
+        let branch = self.git_panel.worktree_branch.text.trim().to_owned();
+        if path_raw.is_empty() || branch.is_empty() {
+            self.status = Some("Enter both a worktree path and a branch name.".into());
+            tx.instant();
+            return;
+        }
+        let Some(proj) = &self.project else {
+            self.status = Some("Open a folder first.".into());
+            tx.instant();
+            return;
+        };
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::AddWorktree {
+                root: proj.root.clone(),
+                path: PathBuf::from(path_raw),
+                branch,
+            });
+        }
+        self.git_panel.worktree_path.clear();
+        self.git_panel.worktree_branch.clear();
+        self.git_panel.add_worktree_open = false;
+        tx.blur();
+        if let OpenPage::Editor(ed) = &mut self.page {
+            ed.focused = !self.find_open && !self.git_panel.commit_open;
+        }
+        tx.instant();
+    }
+
     fn confirm_pending(&mut self, tx: &mut Tx) {
         let Some(confirm) = self.git_panel.confirm.take() else {
             return;
@@ -761,6 +873,14 @@ impl Pen {
             PendingConfirm::Discard(rel) => {
                 if let (Some(project), Some(io_tx)) = (self.project.clone(), &self.io_tx) {
                     let _ = io_tx.try_send(IoCmd::DiscardFile { project, rel });
+                }
+            }
+            PendingConfirm::RemoveWorktree(path) => {
+                if let (Some(project), Some(io_tx)) = (&self.project, &self.io_tx) {
+                    let _ = io_tx.try_send(IoCmd::RemoveWorktree {
+                        root: project.root.clone(),
+                        path,
+                    });
                 }
             }
         }
@@ -957,6 +1077,11 @@ impl Pen {
                 }
             }
             "Commit" => self.open_commit_bar(tx),
+            "Add worktree" => {
+                if !self.git_panel.add_worktree_open {
+                    self.toggle_add_worktree(tx);
+                }
+            }
             "Discard file" => {
                 let target = self
                     .active_path
@@ -1278,7 +1403,19 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                     tx.instant();
                 },
             );
-            git_dock_container(vec![changes, branches, history])
+            let worktrees = worktrees_section(
+                &s.git_status.worktrees,
+                s.git_panel.add_worktree_open,
+                &s.git_panel.worktree_path,
+                &s.git_panel.worktree_branch,
+                &theme,
+                |s: &mut Pen| &mut s.git_panel.worktree_path,
+                |s: &mut Pen| &mut s.git_panel.worktree_branch,
+                |s: &mut Pen, tx: &mut Tx| s.toggle_add_worktree(tx),
+                |s: &mut Pen, tx: &mut Tx| s.submit_add_worktree(tx),
+                |s: &mut Pen, path: PathBuf, tx: &mut Tx| s.request_remove_worktree(path, tx),
+            );
+            git_dock_container(vec![changes, branches, worktrees, history])
         }
     };
     let mut sidebar = col()
@@ -1834,6 +1971,10 @@ fn populate_demo_diff(s: &mut Pen, theme: &Theme) {
                 summary: "feat: read git status through gix".into(),
             },
         ],
+        worktrees: vec![pen_git::WorktreeInfo {
+            path: PathBuf::from("."),
+            branch: "main".into(),
+        }],
     };
     let patch = "\
 diff --git a/crates/app/src/editor.rs b/crates/app/src/editor.rs

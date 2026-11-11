@@ -9,6 +9,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "Stage file",
     "Discard file",
     "Commit",
+    "Add worktree",
     "Split diff",
     "Use Ink",
     "Use Paper",

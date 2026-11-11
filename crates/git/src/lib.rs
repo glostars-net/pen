@@ -47,6 +47,12 @@ pub struct CommitSummary {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    pub branch: String,
+}
+
 impl Repo {
     /// Discover a repository starting at (or above) `start`. `Ok(None)` when
     /// no repository is found; any other failure is a real `GitError`.
@@ -547,6 +553,70 @@ impl Repo {
         }
     }
 
+    /// List the main worktree and every linked worktree, in registration order.
+    pub fn worktrees(&self) -> Result<Vec<WorktreeInfo>, GitError> {
+        let mut out = Vec::new();
+        for item in self.inner.worktrees_including_main()? {
+            let repo = item?;
+            let Some(wd) = repo.workdir() else {
+                continue;
+            };
+            let branch = repo
+                .head_name()?
+                .map(|n| n.shorten().to_string())
+                .unwrap_or_else(|| "detached".to_string());
+            out.push(WorktreeInfo {
+                path: wd.to_path_buf(),
+                branch,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Add a linked worktree at `path` checked out on local `branch` (creating
+    /// `branch` from `HEAD` when it does not exist yet).
+    pub fn add_worktree(&self, path: &Path, branch: &str) -> Result<(), GitError> {
+        use gix::refs::FullName;
+        use gix::refs::transaction::PreviousValue;
+        use std::sync::atomic::AtomicBool;
+
+        let trimmed = branch.trim();
+        if trimmed.is_empty() || path.as_os_str().is_empty() {
+            return Err(GitError::InvalidRef(branch.to_owned()));
+        }
+        let full_name = FullName::try_from(format!("refs/heads/{trimmed}"))
+            .map_err(|e| GitError::InvalidRef(e.to_string()))?;
+        if self.inner.find_reference(&full_name).is_err() {
+            let head_id = self.inner.head_id()?.detach();
+            self.inner.reference(
+                full_name.clone(),
+                head_id,
+                PreviousValue::MustNotExist,
+                "branch: Created from HEAD",
+            )?;
+        }
+        let resolved_dest = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.workdir()?.join(path)
+        };
+        self.inner.add_worktree(
+            &resolved_dest,
+            gix::worktree::add::Head::Attached(full_name),
+            gix::progress::Discard,
+            &AtomicBool::new(false),
+        )?;
+        Ok(())
+    }
+
+    /// Remove a linked worktree at `path` without force (dirty or locked
+    /// worktrees are refused). Confirmation belongs to the UI caller.
+    pub fn remove_worktree(&self, path: &Path) -> Result<(), GitError> {
+        let target = self.inner.prepare_remove_worktree(path)?;
+        target.remove(gix::worktree::remove::Force::Never, gix::progress::Discard)?;
+        Ok(())
+    }
+
     /// Line-level `(added, removed)` between the index blob at `id` and the
     /// worktree file at `root/rel`. Binary or non-UTF-8 content (either
     /// side) returns `(0, 0)`: Pen is UTF-8 only (see phase 1), and a byte
@@ -853,5 +923,46 @@ mod tests {
         assert_eq!(repo.current_branch().unwrap().as_deref(), Some("main"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worktrees_lists_the_main_tree() {
+        let dir = std::env::temp_dir().join(format!("pen-git-wt-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        let trees = Repo::discover(&dir).unwrap().unwrap().worktrees().unwrap();
+        assert!(!trees.is_empty());
+        assert_eq!(trees[0].branch, "main");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worktrees_add_and_remove_roundtrip() {
+        let base = std::env::temp_dir().join(format!("pen-git-wt-add-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let main_dir = base.join("main");
+        let linked_dir = base.join("linked");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        git(&main_dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(main_dir.join("a.txt"), "hello\n").unwrap();
+        git(&main_dir, &["add", "a.txt"]);
+        git(&main_dir, &["commit", "-q", "-m", "init"]);
+
+        let repo = Repo::discover(&main_dir).unwrap().unwrap();
+        repo.add_worktree(&linked_dir, "wt-branch").unwrap();
+        assert!(linked_dir.join("a.txt").exists());
+        assert_eq!(repo.worktrees().unwrap().len(), 2);
+
+        repo.remove_worktree(&linked_dir).unwrap();
+        assert!(!linked_dir.exists());
+        assert_eq!(repo.worktrees().unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

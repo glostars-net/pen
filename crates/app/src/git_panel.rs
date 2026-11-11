@@ -27,6 +27,7 @@ pub enum SidebarMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingConfirm {
     Discard(PathBuf),
+    RemoveWorktree(PathBuf),
 }
 
 impl PendingConfirm {
@@ -40,6 +41,9 @@ impl PendingConfirm {
                     .unwrap_or_else(|| rel_display(rel));
                 format!("Discard changes to {name}?")
             }
+            PendingConfirm::RemoveWorktree(path) => {
+                format!("Remove worktree {}?", path.display())
+            }
         }
     }
 }
@@ -52,6 +56,9 @@ pub struct GitPanelState {
     pub selected_commit: Option<String>,
     pub commit_open: bool,
     pub commit_message: TextEdit,
+    pub add_worktree_open: bool,
+    pub worktree_path: TextEdit,
+    pub worktree_branch: TextEdit,
     pub confirm: Option<PendingConfirm>,
 }
 
@@ -64,6 +71,7 @@ pub struct GitSnapshot {
     pub branches: Vec<String>,
     pub entries: Vec<pen_git::StatusEntry>,
     pub history: Vec<pen_git::CommitSummary>,
+    pub worktrees: Vec<pen_git::WorktreeInfo>,
 }
 
 /// `"+2 −1"` for a modification, `"new"` for an untracked file, `""` when
@@ -505,6 +513,216 @@ pub fn history_section<S: 'static>(
                     .truncate(),
             )
             .child(text(commit.id.clone()).font(id_font).color(faint));
+        list = list.child(item);
+    }
+    section.child(list)
+}
+
+/// Render the `"Worktrees"` section inside the Git dock: two single-line
+/// inputs for adding a worktree (path + branch, never a wizard), and a `×`
+/// remove action on linked worktrees that triggers confirmation in the app.
+#[allow(clippy::too_many_arguments)]
+pub fn worktrees_section<S: 'static>(
+    worktrees: &[pen_git::WorktreeInfo],
+    add_open: bool,
+    path_edit: &TextEdit,
+    branch_edit: &TextEdit,
+    theme: &Theme,
+    edit_path: impl Fn(&mut S) -> &mut TextEdit + 'static,
+    edit_branch: impl Fn(&mut S) -> &mut TextEdit + 'static,
+    on_toggle_add: impl Fn(&mut S, &mut Tx) + Clone + 'static,
+    on_submit_add: impl Fn(&mut S, &mut Tx) + Clone + 'static,
+    on_remove: impl Fn(&mut S, PathBuf, &mut Tx) + Clone + 'static,
+) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let rule = fg.alpha(0.20);
+
+    let toggle_head = on_toggle_add.clone();
+    let head = row()
+        .key("pen/git-worktrees-head")
+        .w_full()
+        .h(24.0)
+        .px(8.0)
+        .center_y()
+        .justify_between()
+        .child(text("Worktrees").font(UI_MEDIUM_FONT).color(faint))
+        .child(
+            row()
+                .key("pen/git-worktree-add-btn")
+                .role("button")
+                .label("Add worktree")
+                .focusable(true)
+                .size(20.0, 20.0)
+                .radius(4.0)
+                .center()
+                .cursor(Cursor::Pointer)
+                .hover(fg.alpha(0.08))
+                .transition(Transition::none())
+                .on_press_tx(toggle_head)
+                .child(text("+").font(UI_MEDIUM_FONT).color(faint)),
+        );
+
+    let mut section = col().key("pen/git-worktrees").w_full().gap(4.0).child(head);
+
+    if add_open {
+        let cancel_key = on_toggle_add.clone();
+        let cancel_key2 = on_toggle_add.clone();
+        let submit_key = on_submit_add.clone();
+        let path_input = text_input(path_edit, MONO_UI_FONT)
+            .key("pen/wt-path-input")
+            .label("Worktree path")
+            .single_line()
+            .placeholder("../worktree-dir", faint)
+            .color(fg)
+            .caret(fg, fg.alpha(0.12))
+            .w_full()
+            .h(22.0)
+            .on_edit(edit_path)
+            .on_input_key(move |s: &mut S, ev: &KeyEvent, tx: &mut Tx| match ev.key {
+                Key::Escape => {
+                    cancel_key(s, tx);
+                    true
+                }
+                _ => false,
+            });
+        let branch_input = text_input(branch_edit, MONO_UI_FONT)
+            .key("pen/wt-branch-input")
+            .label("Worktree branch")
+            .single_line()
+            .placeholder("branch-name", faint)
+            .color(fg)
+            .caret(fg, fg.alpha(0.12))
+            .w_full()
+            .h(22.0)
+            .on_edit(edit_branch)
+            .on_input_key(move |s: &mut S, ev: &KeyEvent, tx: &mut Tx| match ev.key {
+                Key::Escape => {
+                    cancel_key2(s, tx);
+                    true
+                }
+                Key::Enter => {
+                    submit_key(s, tx);
+                    true
+                }
+                _ => false,
+            });
+
+        let form = col()
+            .key("pen/git-worktree-form")
+            .w_full()
+            .padding(6.0)
+            .gap(6.0)
+            .radius(6.0)
+            .border(1.0, rule)
+            .child(
+                row()
+                    .w_full()
+                    .px(6.0)
+                    .h(26.0)
+                    .center_y()
+                    .border_sides([0.0, 0.0, 1.0, 0.0], rule)
+                    .child(path_input),
+            )
+            .child(
+                row()
+                    .w_full()
+                    .px(6.0)
+                    .h(26.0)
+                    .center_y()
+                    .child(branch_input),
+            )
+            .child(
+                row()
+                    .w_full()
+                    .justify_end()
+                    .gap(6.0)
+                    .child(
+                        row()
+                            .key("pen/wt-cancel")
+                            .role("button")
+                            .label("Cancel")
+                            .focusable(true)
+                            .h(22.0)
+                            .px(8.0)
+                            .radius(4.0)
+                            .center()
+                            .cursor(Cursor::Pointer)
+                            .hover(fg.alpha(0.06))
+                            .transition(Transition::none())
+                            .on_press_tx(on_toggle_add)
+                            .child(text("Cancel").font(UI_FONT).color(faint)),
+                    )
+                    .child(
+                        row()
+                            .key("pen/wt-submit")
+                            .role("button")
+                            .label("Add")
+                            .focusable(true)
+                            .h(22.0)
+                            .px(8.0)
+                            .radius(4.0)
+                            .center()
+                            .cursor(Cursor::Pointer)
+                            .border(1.0, rule)
+                            .hover(fg.alpha(0.08))
+                            .transition(Transition::none())
+                            .on_press_tx(on_submit_add)
+                            .child(text("Add").font(UI_MEDIUM_FONT).color(fg)),
+                    ),
+            );
+        section = section.child(form);
+    }
+
+    let mut list = col().key("pen/git-worktrees-rows").w_full().gap(1.0);
+    for (idx, wt) in worktrees.iter().enumerate() {
+        let label_text = wt
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| wt.path.display().to_string());
+        let mut item = row()
+            .key(format!("pen/wt-{}", wt.path.display()))
+            .w_full()
+            .h(28.0)
+            .px(8.0)
+            .gap(8.0)
+            .radius(6.0)
+            .center_y()
+            .fill(bg)
+            .transition(Transition::none())
+            .child(
+                text(label_text)
+                    .font(UI_FONT)
+                    .color(fg)
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0)
+                    .truncate(),
+            )
+            .child(text(wt.branch.clone()).font(UI_FONT).color(faint));
+
+        if idx > 0 {
+            let rm_path = wt.path.clone();
+            let rm_cb = on_remove.clone();
+            item = item.child(
+                row()
+                    .key(format!("pen/wt-rm-{}", wt.path.display()))
+                    .role("button")
+                    .label(format!("Remove worktree {}", wt.path.display()))
+                    .focusable(true)
+                    .size(20.0, 20.0)
+                    .radius(4.0)
+                    .center()
+                    .cursor(Cursor::Pointer)
+                    .hover(fg.alpha(0.10))
+                    .transition(Transition::none())
+                    .on_press_tx(move |s: &mut S, tx: &mut Tx| rm_cb(s, rm_path.clone(), tx))
+                    .child(text("×").font(UI_FONT).color(faint)),
+            );
+        }
         list = list.child(item);
     }
     section.child(list)
