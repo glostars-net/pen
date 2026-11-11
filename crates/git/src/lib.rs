@@ -31,6 +31,14 @@ pub struct StatusEntry {
     pub tracked: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSummary {
+    /// 7-character hex prefix of the commit's object id.
+    pub id: String,
+    /// First line of the commit message, trimmed.
+    pub summary: String,
+}
+
 impl Repo {
     /// Discover a repository starting at (or above) `start`. `Ok(None)` when
     /// no repository is found; any other failure is a real `GitError`.
@@ -98,6 +106,31 @@ impl Repo {
         Ok(entries)
     }
 
+    /// Walk up to `limit` commits reachable from `HEAD`, newest first. An
+    /// empty (unborn) repository returns `Ok(Vec::new())`, not an error.
+    pub fn log(&self, limit: usize) -> Result<Vec<CommitSummary>, GitError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let head = self.inner.head()?;
+        if head.is_unborn() {
+            return Ok(Vec::new());
+        }
+        let tip = head.into_peeled_id()?.detach();
+        let walk = self.inner.rev_walk([tip]).all()?;
+        let mut out = Vec::with_capacity(limit.min(64));
+        for item in walk.take(limit) {
+            let info = item?;
+            let commit = info.object()?;
+            let hex = info.id.to_string();
+            let id = hex.chars().take(7).collect();
+            let raw = String::from_utf8_lossy(commit.message_raw_sloppy().as_ref());
+            let summary = raw.lines().next().unwrap_or("").trim().to_string();
+            out.push(CommitSummary { id, summary });
+        }
+        Ok(out)
+    }
+
     /// Line-level `(added, removed)` between the index blob at `id` and the
     /// worktree file at `root/rel`. Binary or non-UTF-8 content (either
     /// side) returns `(0, 0)`: Pen is UTF-8 only (see phase 1), and a byte
@@ -157,6 +190,38 @@ mod tests {
         let repo = Repo::discover(&dir).unwrap().unwrap();
         let entries = repo.status().unwrap();
         assert!(entries.iter().any(|e| e.rel.ends_with("keep.rs")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn log_returns_newest_first() {
+        let dir = std::env::temp_dir().join(format!("pen-git-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        assert!(
+            Repo::discover(&dir)
+                .unwrap()
+                .unwrap()
+                .log(10)
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "first"]);
+
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "second\n\nbody line"]);
+
+        let log = Repo::discover(&dir).unwrap().unwrap().log(10).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].summary, "second");
+        assert_eq!(log[0].id.len(), 7);
+        assert_eq!(log[1].summary, "first");
 
         std::fs::remove_dir_all(&dir).ok();
     }

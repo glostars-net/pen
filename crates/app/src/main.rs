@@ -14,7 +14,9 @@ use buffer::Buffer;
 use highlight::{Theme, lang_for_path, load_theme};
 use pen::disk::{DiskEvent, on_disk_change};
 use pen::editor::{CODE_SIZE, EditorState, LINE_H, editor_view_themed};
-use pen::git_panel::{GitSnapshot, status_label};
+use pen::git_panel::{
+    GitPanelState, GitSnapshot, SidebarMode, git_dock_container, history_section, status_label,
+};
 use pen::palette::{BUILTIN_COMMANDS, filter_commands, shortcut_hint};
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, rgb_color};
 use project::watch::{ProjectWatcher, WatchEvent, watch_project_with};
@@ -143,6 +145,7 @@ struct Pen {
     reveal_first_launch: bool,
     watch_rx: Option<watch::Receiver<Option<WatchEvent>>>,
     git_status: GitSnapshot,
+    git_panel: GitPanelState,
     git_rx: Option<watch::Receiver<GitSnapshot>>,
     io_tx: Option<mpsc::Sender<IoCmd>>,
     io_rx: Option<mpsc::Receiver<IoMsg>>,
@@ -167,6 +170,7 @@ fn init() -> Pen {
         reveal_first_launch: false,
         watch_rx: None,
         git_status: GitSnapshot::default(),
+        git_panel: GitPanelState::default(),
         git_rx: None,
         io_tx: None,
         io_rx: None,
@@ -206,17 +210,21 @@ fn setup(s: &mut Pen, waker: Waker) {
                                 tokio::time::sleep(GIT_STATUS_THROTTLE - elapsed).await;
                                 while git_trigger_rx.try_recv().is_ok() {}
                             }
-                            let entries = tokio::task::spawn_blocking(move || {
-                                pen_git::Repo::discover(&root)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|r| r.status().ok())
-                                    .unwrap_or_default()
+                            let snap = tokio::task::spawn_blocking(move || {
+                                let Some(repo) = pen_git::Repo::discover(&root).ok().flatten()
+                                else {
+                                    return GitSnapshot::default();
+                                };
+                                GitSnapshot {
+                                    is_repo: true,
+                                    entries: repo.status().unwrap_or_default(),
+                                    history: repo.log(50).unwrap_or_default(),
+                                }
                             })
                             .await
                             .unwrap_or_default();
                             last_refresh = Instant::now();
-                            if git_tx.send(GitSnapshot { entries }).is_err() {
+                            if git_tx.send(snap).is_err() {
                                 break;
                             }
                             waker();
@@ -437,6 +445,8 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 s.active_path = None;
                 s.page = OpenPage::Empty;
                 s.unsaved.clear();
+                s.git_status = GitSnapshot::default();
+                s.git_panel = GitPanelState::default();
                 s.status = None;
                 if !s.sidebar.is_open() {
                     s.sidebar.toggle();
@@ -795,38 +805,105 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         );
     }
 
-    let git_labels: Rc<HashMap<PathBuf, String>> = Rc::new(
-        s.git_status
-            .entries
-            .iter()
-            .filter_map(|e| {
-                let lbl = status_label(e);
-                (!lbl.is_empty()).then(|| (e.rel.clone(), lbl))
-            })
-            .collect(),
-    );
-    let tree = Tree::new(|s: &Pen| &s.files, |s: &mut Pen| &mut s.files, tree_label)
-        .name("Files")
-        .row(move |node, r| {
-            let item = TreeItem::file(node, r);
-            match node.data.as_ref().and_then(|rel| git_labels.get(rel)) {
-                Some(lbl) => item.badge(lbl.clone()),
-                None => item,
-            }
-        })
-        .on_select(|s: &mut Pen, id: &str, tx: &mut Tx| s.request_open_file(id, tx))
-        .on_open(|s: &mut Pen, id: &str, tx: &mut Tx| s.request_open_file(id, tx))
-        .build(s, &k)
-        .grow(1.0)
-        .min_h(0.0);
-    let sidebar = col()
+    let sidebar_body = match s.git_panel.mode {
+        SidebarMode::Files => {
+            let git_labels: Rc<HashMap<PathBuf, String>> = Rc::new(
+                s.git_status
+                    .entries
+                    .iter()
+                    .filter_map(|e| {
+                        let lbl = status_label(e);
+                        (!lbl.is_empty()).then(|| (e.rel.clone(), lbl))
+                    })
+                    .collect(),
+            );
+            let tree = Tree::new(|s: &Pen| &s.files, |s: &mut Pen| &mut s.files, tree_label)
+                .name("Files")
+                .row(move |node, r| {
+                    let item = TreeItem::file(node, r);
+                    match node.data.as_ref().and_then(|rel| git_labels.get(rel)) {
+                        Some(lbl) => item.badge(lbl.clone()),
+                        None => item,
+                    }
+                })
+                .on_select(|s: &mut Pen, id: &str, tx: &mut Tx| s.request_open_file(id, tx))
+                .on_open(|s: &mut Pen, id: &str, tx: &mut Tx| s.request_open_file(id, tx))
+                .build(s, &k)
+                .grow(1.0)
+                .min_h(0.0);
+            col()
+                .key("pen/sidebar-files")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .padding(8.0)
+                .child(tree)
+        }
+        SidebarMode::Git => {
+            let history = history_section(
+                &s.git_status.history,
+                s.git_panel.selected_commit.as_deref(),
+                &theme,
+                |s: &mut Pen, id: String, tx: &mut Tx| {
+                    s.git_panel.selected_commit = Some(id);
+                    tx.instant();
+                },
+            );
+            git_dock_container(vec![history])
+        }
+    };
+    let mut sidebar = col()
         .key("pen/sidebar")
         .w_full()
         .h_full()
-        .padding(8.0)
         .fill(bg)
-        .border_sides([1.0, 1.0, 0.0, 0.0], rule)
-        .child(tree);
+        .border_sides([1.0, 1.0, 0.0, 0.0], rule);
+    if s.git_status.is_repo {
+        let files_active = s.git_panel.mode == SidebarMode::Files;
+        let git_active = s.git_panel.mode == SidebarMode::Git;
+        let tab = |key: &str, label: &str, active: bool, target: SidebarMode| {
+            row()
+                .key(key)
+                .role("tab")
+                .label(label)
+                .focusable(true)
+                .h(26.0)
+                .px(8.0)
+                .radius(6.0)
+                .center_y()
+                .cursor(Cursor::Pointer)
+                .fill(if active { fg.alpha(0.08) } else { bg })
+                .hover(fg.alpha(0.06))
+                .transition(Transition::none())
+                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+                    s.git_panel.mode = target;
+                    tx.instant();
+                })
+                .child(
+                    text(label.to_owned())
+                        .font(if active { UI_MEDIUM_FONT } else { UI_FONT })
+                        .color(if active { fg } else { faint }),
+                )
+        };
+        sidebar = sidebar.child(
+            row()
+                .key("pen/sidebar-tabs")
+                .w_full()
+                .h(34.0)
+                .px(8.0)
+                .gap(4.0)
+                .center_y()
+                .border_sides([0.0, 0.0, 1.0, 0.0], rule)
+                .child(tab(
+                    "pen/tab-files",
+                    "Files",
+                    files_active,
+                    SidebarMode::Files,
+                ))
+                .child(tab("pen/tab-git", "Git", git_active, SidebarMode::Git)),
+        );
+    }
+    sidebar = sidebar.child(sidebar_body);
 
     let mut split = SplitView::new(page_stack)
         .sidebar(&s.sidebar, |s: &mut Pen| &mut s.sidebar, sidebar)
