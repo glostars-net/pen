@@ -15,10 +15,11 @@ use highlight::{Theme, lang_for_path, load_theme};
 use pen::disk::{DiskEvent, on_disk_change};
 use pen::editor::{CODE_SIZE, EditorState, LINE_H, editor_view_themed};
 use pen::git_panel::{
-    GitPanelState, GitSnapshot, SidebarMode, git_dock_container, history_section, status_label,
+    GitPanelState, GitSnapshot, SidebarMode, changes_section, diff_page_view, git_dock_container,
+    history_section, status_label,
 };
 use pen::palette::{BUILTIN_COMMANDS, filter_commands, shortcut_hint};
-use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, rgb_color};
+use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, diff_highlighter, rgb_color};
 use project::watch::{ProjectWatcher, WatchEvent, watch_project_with};
 use project::{FileEntry, Project, ReadFile};
 use rune::dirs::AppDirs;
@@ -27,6 +28,7 @@ use rune::{
     OpticalSize, Spring, TextEdit, TextStyle, Transition, Tx, Waker, WheelEvent, col, el, row,
     text, text_input,
 };
+use rune_kit::diff::{DiffMode, DiffState, parse as parse_diff};
 use rune_kit::shell::{self, PaneMotion, PaneState, SplitView, Toolbar};
 use rune_kit::{FileNode, FileTree, Tree, TreeItem, TreeModel};
 use tokio::sync::{mpsc, watch};
@@ -90,6 +92,14 @@ enum IoCmd {
         bytes: Vec<u8>,
     },
     SaveThemePref(&'static str),
+    DiffWorktree {
+        root: PathBuf,
+        rel: PathBuf,
+    },
+    DiffCommit {
+        root: PathBuf,
+        id: String,
+    },
 }
 
 /// Answers sent back from the Tokio disk worker to `poll`.
@@ -117,12 +127,17 @@ enum IoMsg {
     FileSaved {
         rel: PathBuf,
     },
+    DiffLoaded {
+        title: String,
+        patch: String,
+    },
     Error(String),
 }
 
 enum OpenPage {
     Empty,
     Editor(EditorState),
+    Diff { title: String },
     Notice(String),
 }
 
@@ -146,6 +161,8 @@ struct Pen {
     watch_rx: Option<watch::Receiver<Option<WatchEvent>>>,
     git_status: GitSnapshot,
     git_panel: GitPanelState,
+    diff_state: DiffState,
+    diff_theme_bg: highlight::Rgb,
     git_rx: Option<watch::Receiver<GitSnapshot>>,
     io_tx: Option<mpsc::Sender<IoCmd>>,
     io_rx: Option<mpsc::Receiver<IoMsg>>,
@@ -171,6 +188,13 @@ fn init() -> Pen {
         watch_rx: None,
         git_status: GitSnapshot::default(),
         git_panel: GitPanelState::default(),
+        diff_state: {
+            let paper = highlight::paper();
+            let mut ds = DiffState::default();
+            ds.set_highlighter(diff_highlighter(&paper));
+            ds
+        },
+        diff_theme_bg: highlight::paper().bg,
         git_rx: None,
         io_tx: None,
         io_rx: None,
@@ -343,6 +367,39 @@ fn setup(s: &mut Pen, waker: Waker) {
                             .await;
                             continue;
                         }
+                        IoCmd::DiffWorktree { root, rel } => {
+                            tokio::task::spawn_blocking(move || {
+                                let repo = pen_git::Repo::discover(&root)
+                                    .map_err(|e| e.to_string())?
+                                    .ok_or_else(|| "Not a git repository.".to_string())?;
+                                let patch = repo.diff_worktree(&rel).map_err(|e| e.to_string())?;
+                                Ok::<_, String>((
+                                    format!("Changes — {}", path_to_slash(&rel)),
+                                    patch,
+                                ))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.map_err(|e| e.to_string()))
+                            .map_or_else(
+                                IoMsg::Error,
+                                |(title, patch)| IoMsg::DiffLoaded { title, patch },
+                            )
+                        }
+                        IoCmd::DiffCommit { root, id } => tokio::task::spawn_blocking(move || {
+                            let repo = pen_git::Repo::discover(&root)
+                                .map_err(|e| e.to_string())?
+                                .ok_or_else(|| "Not a git repository.".to_string())?;
+                            let patch = repo.diff_commit(&id).map_err(|e| e.to_string())?;
+                            Ok::<_, String>((format!("Changes — {id}"), patch))
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r.map_err(|e| e.to_string()))
+                        .map_or_else(IoMsg::Error, |(title, patch)| IoMsg::DiffLoaded {
+                            title,
+                            patch,
+                        }),
                     };
                     let _ = &active_watcher;
                     if msg_tx.send(reply).await.is_err() {
@@ -516,6 +573,13 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 s.status = None;
                 tx.instant();
             }
+            IoMsg::DiffLoaded { title, patch } => {
+                s.stash_current_if_dirty();
+                s.diff_state.set_files(parse_diff(&patch));
+                s.page = OpenPage::Diff { title };
+                s.status = None;
+                tx.instant();
+            }
             IoMsg::Error(err) => {
                 s.status = Some(err);
                 tx.instant();
@@ -646,15 +710,29 @@ impl Pen {
                 self.request_save();
             }
             "Find" => self.open_find(tx),
+            "Split diff" => {
+                let next = match self.diff_state.mode() {
+                    DiffMode::Unified => DiffMode::Split,
+                    DiffMode::Split => DiffMode::Unified,
+                };
+                self.diff_state.set_mode(next);
+                tx.instant();
+            }
             "Use Ink" => {
+                let ink = highlight::ink();
                 self.theme_pref = ThemePref::Ink;
+                self.diff_theme_bg = ink.bg;
+                self.diff_state.set_highlighter(diff_highlighter(&ink));
                 if let Some(io_tx) = &self.io_tx {
                     let _ = io_tx.try_send(IoCmd::SaveThemePref("ink"));
                 }
                 tx.instant();
             }
             "Use Paper" => {
+                let paper = highlight::paper();
                 self.theme_pref = ThemePref::Paper;
+                self.diff_theme_bg = paper.bg;
+                self.diff_state.set_highlighter(diff_highlighter(&paper));
                 if let Some(io_tx) = &self.io_tx {
                     let _ = io_tx.try_send(IoCmd::SaveThemePref("paper"));
                 }
@@ -760,6 +838,35 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
             .center()
             .transition(Transition::none())
             .child(text(msg.clone()).font(UI_FONT).color(faint)),
+        (_, OpenPage::Diff { title }) => {
+            let resolved_theme = theme.clone();
+            diff_page_view(
+                s,
+                title,
+                &theme,
+                &k,
+                |s: &Pen| &s.diff_state,
+                |s: &mut Pen| &mut s.diff_state,
+                |s: &mut Pen, tx: &mut Tx| {
+                    let next = match s.diff_state.mode() {
+                        DiffMode::Unified => DiffMode::Split,
+                        DiffMode::Split => DiffMode::Unified,
+                    };
+                    s.diff_state.set_mode(next);
+                    tx.instant();
+                },
+            )
+            .on_layout_tx(move |s: &mut Pen, _r: [f32; 4], tx: &mut Tx| {
+                if s.diff_theme_bg != resolved_theme.bg {
+                    s.diff_theme_bg = resolved_theme.bg;
+                    s.diff_state
+                        .set_highlighter(diff_highlighter(&resolved_theme));
+                    tx.instant();
+                } else {
+                    tx.live_only();
+                }
+            })
+        }
         (_, OpenPage::Editor(ed)) => editor_page_container(ed, &theme),
     };
 
@@ -840,16 +947,39 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                 .child(tree)
         }
         SidebarMode::Git => {
+            let changes = changes_section(
+                &s.git_status.entries,
+                s.git_panel.selected_change.as_deref(),
+                &theme,
+                |s: &mut Pen, rel: PathBuf, tx: &mut Tx| {
+                    s.git_panel.selected_change = Some(rel.clone());
+                    s.git_panel.selected_commit = None;
+                    if let (Some(proj), Some(io_tx)) = (&s.project, &s.io_tx) {
+                        let _ = io_tx.try_send(IoCmd::DiffWorktree {
+                            root: proj.root.clone(),
+                            rel,
+                        });
+                    }
+                    tx.instant();
+                },
+            );
             let history = history_section(
                 &s.git_status.history,
                 s.git_panel.selected_commit.as_deref(),
                 &theme,
                 |s: &mut Pen, id: String, tx: &mut Tx| {
-                    s.git_panel.selected_commit = Some(id);
+                    s.git_panel.selected_commit = Some(id.clone());
+                    s.git_panel.selected_change = None;
+                    if let (Some(proj), Some(io_tx)) = (&s.project, &s.io_tx) {
+                        let _ = io_tx.try_send(IoCmd::DiffCommit {
+                            root: proj.root.clone(),
+                            id,
+                        });
+                    }
                     tx.instant();
                 },
             );
-            git_dock_container(vec![history])
+            git_dock_container(vec![changes, history])
         }
     };
     let mut sidebar = col()
@@ -1231,6 +1361,11 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
             _ => {}
         }
     }
+    if let OpenPage::Diff { .. } = &mut s.page
+        && s.diff_state.key(ev, tx)
+    {
+        return true;
+    }
     if let OpenPage::Editor(ed) = &mut s.page
         && ed.focused
         && ed.on_key(ev)
@@ -1293,6 +1428,14 @@ const SCENES: &[(&str, SceneFn)] = &[
             ed.find_and_select("Document", false);
         }
     }),
+    ("diff-paper", |s| {
+        s.theme_pref = ThemePref::Paper;
+        populate_demo_diff(s, &highlight::paper());
+    }),
+    ("diff-ink", |s| {
+        s.theme_pref = ThemePref::Ink;
+        populate_demo_diff(s, &highlight::ink());
+    }),
 ];
 
 fn populate_demo_editor(s: &mut Pen) {
@@ -1352,6 +1495,58 @@ impl Document {
     if !s.sidebar.is_open() {
         s.sidebar.toggle();
     }
+}
+
+fn populate_demo_diff(s: &mut Pen, theme: &Theme) {
+    populate_demo_editor(s);
+    s.active_path = None;
+    s.git_status = GitSnapshot {
+        is_repo: true,
+        entries: vec![
+            pen_git::StatusEntry {
+                rel: PathBuf::from("crates/app/src/editor.rs"),
+                added: 3,
+                removed: 1,
+                tracked: true,
+            },
+            pen_git::StatusEntry {
+                rel: PathBuf::from("crates/git/src/lib.rs"),
+                added: 0,
+                removed: 0,
+                tracked: false,
+            },
+        ],
+        history: vec![
+            pen_git::CommitSummary {
+                id: "974428d".into(),
+                summary: "feat: show git status in the file tree".into(),
+            },
+            pen_git::CommitSummary {
+                id: "cc1381a".into(),
+                summary: "feat: read git status through gix".into(),
+            },
+        ],
+    };
+    let patch = "\
+diff --git a/crates/app/src/editor.rs b/crates/app/src/editor.rs
+--- a/crates/app/src/editor.rs
++++ b/crates/app/src/editor.rs
+@@ -9,5 +9,7 @@ impl Document {
+     pub fn open(path: &Path) -> Option<Self> {
+         let title = path.file_name()?.to_str()?.to_owned();
+-        Some(Document { title, saved: true })
++        let saved = path.exists();
++        let doc = Document { title, saved };
++        Some(doc)
+     }
+ }
+";
+    s.diff_theme_bg = theme.bg;
+    s.diff_state.set_highlighter(diff_highlighter(theme));
+    s.diff_state.set_files(parse_diff(patch));
+    s.page = OpenPage::Diff {
+        title: "Changes — crates/app/src/editor.rs".into(),
+    };
 }
 
 fn main() {

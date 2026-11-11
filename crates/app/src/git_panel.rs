@@ -1,10 +1,14 @@
-//! Git panel & status helpers (`crates/app/src/git_panel.rs`).
+//! Git panel, status labels, and monochrome diff surface (`crates/app/src/git_panel.rs`).
 //!
 //! All data here is read-only on the UI thread: a Tokio worker refreshes
-//! [`GitSnapshot`] off-thread and publishes it over a `watch` channel.
+//! [`GitSnapshot`] and diff patches off-thread and publishes them back.
+
+use std::path::PathBuf;
 
 use highlight::Theme;
 use rune::{Cursor, El, ScrollSpec, TextStyle, Transition, Tx, col, row, text};
+use rune_kit::Kit;
+use rune_kit::diff::{DiffMode, DiffState, DiffView};
 
 use crate::theme_kit::{UI_FONT, UI_MEDIUM_FONT, rgb_color};
 
@@ -20,6 +24,7 @@ pub enum SidebarMode {
 #[derive(Debug, Default)]
 pub struct GitPanelState {
     pub mode: SidebarMode,
+    pub selected_change: Option<PathBuf>,
     pub selected_commit: Option<String>,
 }
 
@@ -42,6 +47,104 @@ pub fn status_label(entry: &pen_git::StatusEntry) -> String {
         (0, 0) => String::new(),
         (added, removed) => format!("+{added} \u{2212}{removed}"),
     }
+}
+
+fn rel_display(rel: &std::path::Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Render the `"Changes"` section at the top of the Git dock (Zed-style):
+/// clicking a row opens its unstaged diff in the main page.
+pub fn changes_section<S: 'static>(
+    entries: &[pen_git::StatusEntry],
+    selected: Option<&std::path::Path>,
+    theme: &Theme,
+    on_select: impl Fn(&mut S, PathBuf, &mut Tx) + Clone + 'static,
+) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let count_font = TextStyle {
+        size: 11.0,
+        line_height: 16.0,
+        features: "'tnum' 1",
+        ..UI_FONT
+    };
+
+    let mut head = row()
+        .key("pen/git-changes-head")
+        .w_full()
+        .h(24.0)
+        .px(8.0)
+        .center_y()
+        .justify_between()
+        .child(text("Changes").font(UI_MEDIUM_FONT).color(faint));
+    if !entries.is_empty() {
+        head = head.child(
+            text(entries.len().to_string())
+                .font(count_font)
+                .color(faint),
+        );
+    }
+
+    let section = col().key("pen/git-changes").w_full().gap(2.0).child(head);
+    if entries.is_empty() {
+        return section.child(
+            row()
+                .key("pen/git-changes-empty")
+                .w_full()
+                .h(28.0)
+                .px(8.0)
+                .center_y()
+                .child(text("Working tree clean").font(UI_FONT).color(faint)),
+        );
+    }
+
+    let mut list = col().key("pen/git-changes-rows").w_full().gap(1.0);
+    for entry in entries {
+        let active = selected == Some(entry.rel.as_path());
+        let slash = rel_display(&entry.rel);
+        let lbl = status_label(entry);
+        let rel_owned = entry.rel.clone();
+        let cb = on_select.clone();
+        let mut item = row()
+            .key(format!("pen/change-{slash}"))
+            .role("option")
+            .label(if lbl.is_empty() {
+                slash.clone()
+            } else {
+                format!("{slash} {lbl}")
+            })
+            .focusable(true)
+            .w_full()
+            .h(28.0)
+            .px(8.0)
+            .gap(8.0)
+            .radius(6.0)
+            .center_y()
+            .cursor(Cursor::Pointer)
+            .fill(if active { fg.alpha(0.10) } else { bg })
+            .hover(fg.alpha(0.06))
+            .transition(Transition::none())
+            .on_press_tx(move |s: &mut S, tx: &mut Tx| cb(s, rel_owned.clone(), tx))
+            .child(
+                text(slash)
+                    .font(UI_FONT)
+                    .color(fg)
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0)
+                    .truncate(),
+            );
+        if !lbl.is_empty() {
+            item = item.child(text(lbl).font(count_font).color(faint));
+        }
+        list = list.child(item);
+    }
+    section.child(list)
 }
 
 /// Render the History list inside the Git panel. Each row shows the commit's
@@ -136,6 +239,92 @@ pub fn git_dock_container(children: Vec<El>) -> El {
         })
         .transition(Transition::none())
         .children(children)
+}
+
+/// Monochrome diff page (Zed-inspired header + `rune_kit::diff::DiffView`).
+pub fn diff_page_view<S: 'static>(
+    state: &S,
+    title: &str,
+    theme: &Theme,
+    kit: &Kit,
+    get: impl Fn(&S) -> &DiffState + 'static,
+    get_mut: impl Fn(&mut S) -> &mut DiffState + 'static,
+    on_toggle_split: impl Fn(&mut S, &mut Tx) + 'static,
+) -> El {
+    let ds = get(state);
+    let mode = ds.mode();
+    let empty = ds.files().is_empty();
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let rule = fg.alpha(0.20);
+    let toggle_label = match mode {
+        DiffMode::Unified => "Split diff",
+        DiffMode::Split => "Unified diff",
+    };
+
+    let header = row()
+        .key("pen/diff-header")
+        .w_full()
+        .h(36.0)
+        .px(16.0)
+        .center_y()
+        .justify_between()
+        .fill(bg)
+        .border_sides([0.0, 0.0, 1.0, 0.0], rule)
+        .transition(Transition::none())
+        .child(
+            text(title.to_owned())
+                .font(UI_MEDIUM_FONT)
+                .color(fg)
+                .truncate(),
+        )
+        .child(
+            row()
+                .key("pen/diff-mode-toggle")
+                .role("button")
+                .label(toggle_label)
+                .focusable(true)
+                .h(26.0)
+                .px(10.0)
+                .radius(6.0)
+                .center_y()
+                .cursor(Cursor::Pointer)
+                .border(1.0, rule)
+                .hover(fg.alpha(0.06))
+                .transition(Transition::none())
+                .on_press_tx(on_toggle_split)
+                .child(text(toggle_label).font(UI_FONT).color(faint)),
+        );
+
+    let body = if empty {
+        col()
+            .key("pen/diff-empty")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .fill(bg)
+            .center()
+            .transition(Transition::none())
+            .child(text("No changes").font(UI_FONT).color(faint))
+    } else {
+        DiffView::new(get, get_mut)
+            .key("pen/diff-view")
+            .build(state, kit)
+            .grow(1.0)
+            .min_h(0.0)
+    };
+
+    col()
+        .key("pen/diff-page")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(bg)
+        .instant_changes()
+        .transition(Transition::none())
+        .child(header)
+        .child(body)
 }
 
 #[cfg(test)]

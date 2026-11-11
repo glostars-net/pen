@@ -1,8 +1,15 @@
 //! Pen's command palette: case-insensitive filtering over the five phase-1
 //! built-in commands. Opens and dismisses with zero animation.
 
-/// The five phase-1 built-in commands, in sentence case (Task 10).
-pub const BUILTIN_COMMANDS: &[&str] = &["Open folder", "Save", "Find", "Use Ink", "Use Paper"];
+/// Built-in commands exposed in the palette, in sentence case.
+pub const BUILTIN_COMMANDS: &[&str] = &[
+    "Open folder",
+    "Save",
+    "Find",
+    "Split diff",
+    "Use Ink",
+    "Use Paper",
+];
 
 /// Case-insensitive substring filter over `commands`, preserving order.
 pub fn filter_commands(query: &str, commands: &[&str]) -> Vec<String> {
@@ -49,7 +56,7 @@ mod tests {
     #[test]
     fn empty_query_returns_all_in_order() {
         let hits = filter_commands("  ", BUILTIN_COMMANDS);
-        assert_eq!(hits.len(), 5);
+        assert_eq!(hits.len(), BUILTIN_COMMANDS.len());
         assert_eq!(hits[0], "Open folder");
     }
 }

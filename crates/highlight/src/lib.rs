@@ -51,6 +51,8 @@ pub struct Theme {
     pub fg: Rgb,
     pub faint: Rgb,
     pub selection: Rgb,
+    pub added: Rgb,
+    pub removed: Rgb,
     pub syntax: [Rgb; 5],
 }
 
@@ -70,6 +72,10 @@ struct RawTheme {
     fg: Option<String>,
     #[serde(default)]
     accent: Option<String>,
+    #[serde(default)]
+    added: Option<String>,
+    #[serde(default)]
+    removed: Option<String>,
     #[serde(default)]
     syntax: Option<Vec<String>>,
 }
@@ -143,12 +149,29 @@ pub fn load_theme(json: &str) -> Result<Theme, ThemeError> {
         }
     }
 
+    // Added / removed diff ink steps: crisp forward ink for additions, softer
+    // receding ink for removals — both contrast-checked >= 4.5:1 against `bg`.
+    let mut added = walk_to_contrast(mix_oklab(fg, bg, 0.10), fg, bg);
+    let mut removed = walk_to_contrast(mix_oklab(fg, bg, 0.44), fg, bg);
+    if let Some(a) = raw.added.as_deref().and_then(Rgb::try_from_hex)
+        && contrast_ratio(a, bg) >= MIN_CONTRAST
+    {
+        added = a;
+    }
+    if let Some(r) = raw.removed.as_deref().and_then(Rgb::try_from_hex)
+        && contrast_ratio(r, bg) >= MIN_CONTRAST
+    {
+        removed = r;
+    }
+
     Ok(Theme {
         name,
         bg,
         fg,
         faint,
         selection,
+        added,
+        removed,
         syntax,
     })
 }
@@ -306,6 +329,9 @@ mod tests {
             let t = load_theme(raw).unwrap();
             assert!(contrast_ratio(t.fg, t.bg) >= 4.5);
             assert!(contrast_ratio(t.faint, t.bg) >= 4.5);
+            assert!(contrast_ratio(t.added, t.bg) >= 4.5);
+            assert!(contrast_ratio(t.removed, t.bg) >= 4.5);
+            assert_ne!(t.added, t.removed);
             for step in t.syntax {
                 assert!(contrast_ratio(step, t.bg) >= 4.5);
             }
