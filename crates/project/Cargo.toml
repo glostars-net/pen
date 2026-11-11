@@ -7,7 +7,9 @@ description = "Pen's folder layer: gitignore-aware file listing, atomic writes, 
 
 [dependencies]
 ignore.workspace = true
+notify.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

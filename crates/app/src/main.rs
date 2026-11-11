@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use buffer::Buffer;
+use pen::disk::{DiskEvent, on_disk_change};
 use pen::editor::{EditorState, PagePalette, editor_view};
+use project::watch::{ProjectWatcher, WatchEvent, watch_project_with};
 use project::{FileEntry, Project, ReadFile};
 use rune::{
     AppSpec, Cursor, Cx, Drag, El, Family, Ime, Key, KeyEvent, OpticalSize, Spring, TextStyle,
@@ -17,7 +19,7 @@ use rune::{
 };
 use rune_kit::shell::{self, PaneMotion, PaneState, SplitView, Toolbar};
 use rune_kit::{FileNode, FileTree, Kit, Tree, TreeItem, TreeModel};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 const UI_FONT: TextStyle = TextStyle {
     size: 13.0,
@@ -34,14 +36,22 @@ const UI_FONT: TextStyle = TextStyle {
 /// Requests sent from the UI thread to the Tokio disk worker.
 enum IoCmd {
     OpenProject(PathBuf),
+    RefreshTree(Project),
     ReadFile { project: Project, rel: PathBuf },
+    ReloadCleanFile { project: Project, rel: PathBuf },
     SaveFile { project: Project, rel: PathBuf, bytes: Vec<u8> },
 }
 
 /// Answers sent back from the Tokio disk worker to `poll`.
 enum IoMsg {
-    ProjectListed { project: Project, entries: Vec<FileEntry> },
+    ProjectListed {
+        project: Project,
+        entries: Vec<FileEntry>,
+        watch_rx: Option<watch::Receiver<Option<WatchEvent>>>,
+    },
+    TreeRefreshed { entries: Vec<FileEntry> },
     FileRead { rel: PathBuf, result: ReadFile },
+    FileReloaded { rel: PathBuf, result: ReadFile },
     FileSaved { rel: PathBuf },
     Error(String),
 }
@@ -63,6 +73,7 @@ struct Pen {
     /// file in the tree never discards work.
     unsaved: BTreeMap<PathBuf, EditorState>,
     status: Option<String>,
+    watch_rx: Option<watch::Receiver<Option<WatchEvent>>>,
     io_tx: Option<mpsc::Sender<IoCmd>>,
     io_rx: Option<mpsc::Receiver<IoMsg>>,
 }
@@ -76,6 +87,7 @@ fn init() -> Pen {
         page: OpenPage::Empty,
         unsaved: BTreeMap::new(),
         status: None,
+        watch_rx: None,
         io_tx: None,
         io_rx: None,
     }
@@ -98,20 +110,40 @@ fn setup(s: &mut Pen, waker: Waker) {
                 return;
             };
             rt.block_on(async move {
+                let mut active_watcher: Option<ProjectWatcher> = None;
                 while let Some(cmd) = cmd_rx.recv().await {
                     let reply = match cmd {
                         IoCmd::OpenProject(path) => {
-                            tokio::task::spawn_blocking(move || {
+                            active_watcher = None;
+                            let res = tokio::task::spawn_blocking(move || {
                                 let project = Project::open(path)?;
                                 let entries = project.list()?;
                                 Ok::<_, project::ProjectError>((project, entries))
                             })
                             .await
                             .map_err(|e| e.to_string())
-                            .and_then(|r| r.map_err(|e| e.to_string()))
-                            .map_or_else(IoMsg::Error, |(project, entries)| {
-                                IoMsg::ProjectListed { project, entries }
-                            })
+                            .and_then(|r| r.map_err(|e| e.to_string()));
+                            match res {
+                                Ok((project, entries)) => {
+                                    let w = waker.clone();
+                                    let watch_rx = match watch_project_with(&project, move || w()) {
+                                        Ok((guard, rx)) => {
+                                            active_watcher = Some(guard);
+                                            Some(rx)
+                                        }
+                                        Err(_) => None,
+                                    };
+                                    IoMsg::ProjectListed { project, entries, watch_rx }
+                                }
+                                Err(e) => IoMsg::Error(e),
+                            }
+                        }
+                        IoCmd::RefreshTree(project) => {
+                            tokio::task::spawn_blocking(move || project.list())
+                                .await
+                                .map_err(|e| e.to_string())
+                                .and_then(|r| r.map_err(|e| e.to_string()))
+                                .map_or_else(IoMsg::Error, |entries| IoMsg::TreeRefreshed { entries })
                         }
                         IoCmd::ReadFile { project, rel } => {
                             tokio::task::spawn_blocking(move || {
@@ -125,6 +157,18 @@ fn setup(s: &mut Pen, waker: Waker) {
                                 IoMsg::FileRead { rel, result }
                             })
                         }
+                        IoCmd::ReloadCleanFile { project, rel } => {
+                            tokio::task::spawn_blocking(move || {
+                                let result = project.read(&rel)?;
+                                Ok::<_, project::ProjectError>((rel, result))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.map_err(|e| e.to_string()))
+                            .map_or_else(IoMsg::Error, |(rel, result)| {
+                                IoMsg::FileReloaded { rel, result }
+                            })
+                        }
                         IoCmd::SaveFile { project, rel, bytes } => {
                             tokio::task::spawn_blocking(move || {
                                 project.write_atomic(&rel, &bytes)?;
@@ -136,6 +180,7 @@ fn setup(s: &mut Pen, waker: Waker) {
                             .map_or_else(IoMsg::Error, |rel| IoMsg::FileSaved { rel })
                         }
                     };
+                    let _ = &active_watcher;
                     if msg_tx.send(reply).await.is_err() {
                         break;
                     }
@@ -149,33 +194,70 @@ fn setup(s: &mut Pen, waker: Waker) {
 }
 
 fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
-    let Some(rx) = &mut s.io_rx else { return false };
+    let mut changed = false;
+
+    // Non-blocking read of the latest watcher event (`tokio::sync::watch`).
+    let watch_ev = s
+        .watch_rx
+        .as_mut()
+        .filter(|rx| rx.has_changed().unwrap_or(false))
+        .and_then(|rx| rx.borrow_and_update().clone());
+    if let Some(WatchEvent::Changed(rel)) = watch_ev {
+        if s.active_path.as_ref() == Some(&rel) {
+            let dirty = matches!(&s.page, OpenPage::Editor(ed) if ed.buffer.is_dirty());
+            match on_disk_change(dirty) {
+                DiskEvent::Keep => {
+                    s.status = Some("Changed on disk. Your copy is kept.".into());
+                    changed = true;
+                    tx.instant();
+                }
+                DiskEvent::Reload => {
+                    if let (Some(project), Some(io_tx)) = (s.project.clone(), &s.io_tx) {
+                        let _ = io_tx.try_send(IoCmd::ReloadCleanFile { project, rel: rel.clone() });
+                    }
+                }
+            }
+        }
+        let slash = path_to_slash(&rel);
+        if !s.files.contains(&slash)
+            && let (Some(project), Some(io_tx)) = (s.project.clone(), &s.io_tx)
+        {
+            let _ = io_tx.try_send(IoCmd::RefreshTree(project));
+        }
+    }
+
     let mut batch = Vec::new();
-    while let Ok(msg) = rx.try_recv() {
-        batch.push(msg);
+    if let Some(rx) = &mut s.io_rx {
+        while let Ok(msg) = rx.try_recv() {
+            batch.push(msg);
+        }
     }
     if batch.is_empty() {
-        return false;
+        return changed;
     }
     for msg in batch {
         match msg {
-            IoMsg::ProjectListed { project, entries } => {
-                let pairs = entries.into_iter().filter(|e| !e.is_dir).map(|e| {
-                    let slash = path_to_slash(&e.rel);
-                    (slash, e.rel)
-                });
-                let mut tree = FileTree::new().key("pen/tree").build(pairs);
-                tree.expand_all();
-                s.files = tree;
+            IoMsg::ProjectListed { project, entries, watch_rx } => {
+                s.files = build_file_tree(entries);
                 s.project = Some(project);
+                s.watch_rx = watch_rx;
                 s.active_path = None;
                 s.page = OpenPage::Empty;
                 s.unsaved.clear();
                 s.status = None;
                 tx.instant();
             }
+            IoMsg::TreeRefreshed { entries } => {
+                let selected = s.files.cursor().map(str::to_owned);
+                s.files = build_file_tree(entries);
+                if let Some(id) = selected
+                    && s.files.contains(&id)
+                {
+                    s.files.select(&id);
+                }
+                tx.instant();
+            }
             IoMsg::FileRead { rel, result } => {
-                // Stash the outgoing buffer if it has unsaved edits.
                 s.stash_current_if_dirty();
                 s.active_path = Some(rel);
                 s.page = match result {
@@ -188,6 +270,32 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 };
                 s.status = None;
                 tx.instant();
+            }
+            IoMsg::FileReloaded { rel, result } => {
+                if s.active_path.as_ref() == Some(&rel) {
+                    match (&mut s.page, result) {
+                        (OpenPage::Editor(ed), _) if ed.buffer.is_dirty() => {
+                            s.status = Some("Changed on disk. Your copy is kept.".into());
+                        }
+                        (OpenPage::Editor(ed), ReadFile::Utf8(src)) => {
+                            if ed.buffer.text() != src {
+                                let caret = ed.caret;
+                                let scroll_y = ed.scroll_y;
+                                let mut buf = Buffer::from_str(&src);
+                                buf.mark_saved();
+                                ed.caret = caret.min(buf.len_chars());
+                                ed.anchor = ed.caret;
+                                ed.scroll_y = scroll_y;
+                                ed.buffer = buf;
+                            }
+                        }
+                        (_, ReadFile::NotUtf8) => {
+                            s.page = OpenPage::Notice("This file is not UTF-8.".into());
+                        }
+                        _ => {}
+                    }
+                    tx.instant();
+                }
             }
             IoMsg::FileSaved { rel } => {
                 if s.active_path.as_ref() == Some(&rel)
@@ -206,6 +314,16 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
         }
     }
     true
+}
+
+fn build_file_tree(entries: Vec<FileEntry>) -> TreeModel<FileNode<PathBuf>> {
+    let pairs = entries.into_iter().filter(|e| !e.is_dir).map(|e| {
+        let slash = path_to_slash(&e.rel);
+        (slash, e.rel)
+    });
+    let mut tree = FileTree::new().key("pen/tree").build(pairs);
+    tree.expand_all();
+    tree
 }
 
 impl Pen {

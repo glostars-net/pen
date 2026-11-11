@@ -1,6 +1,8 @@
 //! A folder open in Pen: walks files honoring `.gitignore` without following
 //! symlinks outside the root, reads UTF-8 safely, and writes atomically.
 
+pub mod watch;
+
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
@@ -24,6 +26,8 @@ pub enum ProjectError {
     },
     #[error("path escapes project root: {path}")]
     OutsideRoot { path: PathBuf },
+    #[error("watcher error: {0}")]
+    Watch(#[from] notify::Error),
 }
 
 #[derive(Debug, Clone)]
