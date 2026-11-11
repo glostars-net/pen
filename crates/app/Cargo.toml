@@ -5,11 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Pen, a code editor that feels like a pen on paper."
 
+[lib]
+name = "pen"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pen"
 path = "src/main.rs"
 
 [dependencies]
+buffer = { path = "../buffer" }
 rune.workspace = true
 rune-kit.workspace = true
 

@@ -111,6 +111,27 @@ impl Buffer {
         self.rope.len_lines()
     }
 
+    /// Which line `char_idx` sits on, in `O(log N)` without copying the rope.
+    pub fn char_to_line(&self, char_idx: usize) -> usize {
+        self.rope.char_to_line(char_idx.min(self.rope.len_chars()))
+    }
+
+    /// First char index of `line_idx`, in `O(log N)`.
+    pub fn line_to_char(&self, line_idx: usize) -> usize {
+        self.rope.line_to_char(line_idx.min(self.rope.len_lines()))
+    }
+
+    /// Char count of `line_idx` without its trailing `\n` or `\r\n`, in `O(log N)`.
+    pub fn line_len_chars(&self, line_idx: usize) -> usize {
+        let slice = self.rope.line(line_idx);
+        let n = slice.len_chars();
+        if n > 0 && slice.char(n - 1) == '\n' {
+            if n > 1 && slice.char(n - 2) == '\r' { n - 2 } else { n - 1 }
+        } else {
+            n
+        }
+    }
+
     /// One line's text, without its line break.
     pub fn line(&self, line_idx: usize) -> String {
         let line = self.rope.line(line_idx);

@@ -2190,6 +2190,7 @@ dependencies = [
 name = "pen"
 version = "0.1.0"
 dependencies = [
+ "buffer",
  "rune",
  "rune-kit",
 ]
