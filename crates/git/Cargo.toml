@@ -1,0 +1,13 @@
+[package]
+name = "pen-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pen's git facade: a thin, UI-agnostic wrapper over gix for status, log, diff, commit, checkout, and worktrees."
+
+[dependencies]
+gix.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
