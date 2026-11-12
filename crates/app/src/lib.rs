@@ -1,10 +1,13 @@
 //! Pen's library surface: bundled fonts, the editor page, theme mapping, and
 //! disk rules shared between the `pen` binary and integration tests.
 
+pub mod diagnostics;
 pub mod disk;
 pub mod editor;
 pub mod git_guard;
 pub mod git_panel;
+pub mod goto;
+pub mod lsp_host;
 pub mod palette;
 pub mod theme_kit;
 

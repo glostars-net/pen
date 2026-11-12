@@ -3595,6 +3595,7 @@ dependencies = [
  "buffer",
  "highlight",
  "pen-git",
+ "pen-lsp",
  "project",
  "rune",
  "rune-kit",

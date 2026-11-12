@@ -3,9 +3,13 @@
 //! Pen never embeds a server. A missing config is an empty list, and the
 //! editor keeps editing.
 
+mod client;
+
 use std::path::{Component, PathBuf};
 
 use serde::Deserialize;
+
+pub use client::{Client, Published};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LspError {

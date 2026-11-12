@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use buffer::Buffer;
 use highlight::{Theme, lang_for_path, load_theme};
+use pen::diagnostics::{self, Diag};
 use pen::disk::{DiskEvent, on_disk_change};
 use pen::editor::{CODE_SIZE, EditorState, LINE_H, editor_view_themed};
 use pen::git_guard::{CheckoutDecision, decide_checkout};
@@ -20,6 +21,7 @@ use pen::git_panel::{
     coalesce_latest_root, commit_bar, confirm_bar, diff_page_view, git_dock_container,
     git_remote_bar, history_section, status_label, worktrees_section,
 };
+use pen::lsp_host::{self, LspCmd, LspEvent};
 use pen::palette::{BUILTIN_COMMANDS, filter_command_list, shortcut_hint};
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, diff_highlighter, rgb_color};
 use project::watch::{ProjectWatcher, WatchEvent, watch_project_with};
@@ -172,6 +174,9 @@ enum IoMsg {
     Error(String),
 }
 
+// The page is the large variant on purpose. Eight bytes of edit revision
+// crossed clippy's enum threshold; boxing it would touch every match.
+#[allow(clippy::large_enum_variant)]
 enum OpenPage {
     Empty,
     Editor(EditorState),
@@ -204,6 +209,12 @@ struct Pen {
     git_rx: Option<watch::Receiver<GitSnapshot>>,
     io_tx: Option<mpsc::Sender<IoCmd>>,
     io_rx: Option<mpsc::Receiver<IoMsg>>,
+    diags: pen::diagnostics::DiagSnapshot,
+    open_diags: Vec<Diag>,
+    lsp_tx: Option<std::sync::mpsc::SyncSender<LspCmd>>,
+    lsp_rx: Option<std::sync::mpsc::Receiver<LspEvent>>,
+    lsp_rev: u64,
+    pending_jump: Option<(PathBuf, usize)>,
 }
 
 fn init() -> Pen {
@@ -236,10 +247,22 @@ fn init() -> Pen {
         git_rx: None,
         io_tx: None,
         io_rx: None,
+        diags: pen::diagnostics::DiagSnapshot::default(),
+        open_diags: Vec::new(),
+        lsp_tx: None,
+        lsp_rx: None,
+        lsp_rev: 0,
+        pending_jump: None,
     }
 }
 
 fn setup(s: &mut Pen, waker: Waker) {
+    if !rune::is_headless() {
+        let wake = waker.clone();
+        let (lsp_tx, lsp_rx) = lsp_host::spawn(move || wake());
+        s.lsp_tx = Some(lsp_tx);
+        s.lsp_rx = Some(lsp_rx);
+    }
     let headless = rune::is_headless();
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<IoCmd>(32);
     let (msg_tx, msg_rx) = mpsc::channel::<IoMsg>(32);
@@ -692,7 +715,7 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
         }
     }
     if batch.is_empty() {
-        return changed;
+        return changed || take_lsp(s, tx);
     }
     for msg in batch {
         match msg {
@@ -723,6 +746,18 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 s.unsaved.clear();
                 s.git_status = GitSnapshot::default();
                 s.git_panel = GitPanelState::default();
+                s.diags = pen::diagnostics::DiagSnapshot::default();
+                s.open_diags.clear();
+                s.pending_jump = None;
+                if let Some(tx) = &s.lsp_tx {
+                    let _ = tx.try_send(LspCmd::Open {
+                        root: s
+                            .project
+                            .as_ref()
+                            .map(|p| p.root.clone())
+                            .unwrap_or_default(),
+                    });
+                }
                 s.status = None;
                 if !s.sidebar.is_open() {
                     s.sidebar.toggle();
@@ -742,14 +777,30 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
             IoMsg::FileRead { rel, result } => {
                 s.stash_current_if_dirty();
                 let lang = lang_for_path(rel.to_string_lossy().as_ref());
-                s.active_path = Some(rel);
+                s.active_path = Some(rel.clone());
                 s.page = match result {
                     ReadFile::Utf8(src) => {
                         let mut buf = Buffer::from_str(&src);
                         buf.mark_saved();
                         let mut ed = EditorState::from_buffer(buf).with_language(lang);
+                        s.open_diags = s.diags.for_file(&rel);
                         ed.focused =
                             !s.palette_open && !s.find_open && !s.git_panel.has_active_input();
+                        if s.pending_jump
+                            .as_ref()
+                            .is_some_and(|(path, _)| path == &rel)
+                        {
+                            let line = s.pending_jump.take().map(|(_, line)| line).unwrap_or(0);
+                            place_jump(&mut ed, line);
+                        }
+                        if let Some(tx) = &s.lsp_tx {
+                            let _ = tx.try_send(LspCmd::DidOpen {
+                                rel: rel.clone(),
+                                language: lang.unwrap_or("plaintext").to_owned(),
+                                text: src,
+                            });
+                        }
+                        s.lsp_rev = 0;
                         OpenPage::Editor(ed)
                     }
                     ReadFile::NotUtf8 => OpenPage::Notice("This file is not UTF-8.".into()),
@@ -848,7 +899,62 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
+    let _ = take_lsp(s, tx);
     true
+}
+
+fn take_lsp(s: &mut Pen, tx: &mut Tx) -> bool {
+    let Some(rx) = s.lsp_rx.as_ref() else {
+        return false;
+    };
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    if events.is_empty() {
+        return false;
+    }
+    for ev in events {
+        match ev {
+            LspEvent::Diagnostics(snap) => {
+                s.diags = snap;
+                if let Some(rel) = &s.active_path {
+                    s.open_diags = s.diags.for_file(rel);
+                }
+            }
+            LspEvent::Status(note) => {
+                s.status = Some(note);
+                tx.instant();
+            }
+            LspEvent::Jump(jump) => {
+                s.pending_jump = Some((jump.rel.clone(), jump.line));
+                if let (Some(project), Some(io_tx)) = (s.project.clone(), &s.io_tx) {
+                    let _ = io_tx.try_send(IoCmd::ReadFile {
+                        project,
+                        rel: jump.rel,
+                    });
+                }
+                tx.instant();
+            }
+        }
+    }
+    true
+}
+
+fn caret_diag(s: &Pen) -> Option<String> {
+    let OpenPage::Editor(ed) = &s.page else {
+        return None;
+    };
+    let line = ed.buffer.char_to_line(ed.caret);
+    diagnostics::message_on_line(&s.open_diags, line).map(str::to_owned)
+}
+
+fn place_jump(ed: &mut EditorState, line: usize) {
+    let line = line.min(ed.buffer.len_lines().saturating_sub(1));
+    ed.caret = ed.buffer.line_to_char(line);
+    ed.anchor = ed.caret;
+    let target = line as f64 * f64::from(LINE_H);
+    ed.scroll_y = (target - 80.0).max(0.0);
 }
 
 impl Pen {
@@ -1085,6 +1191,67 @@ impl Pen {
         let _ = io_tx.try_send(IoCmd::ReadFile { project, rel });
     }
 
+    fn note_edit(&mut self) {
+        let Some(tx) = &self.lsp_tx else {
+            return;
+        };
+        let Some(rel) = self.active_path.clone() else {
+            return;
+        };
+        let OpenPage::Editor(ed) = &self.page else {
+            return;
+        };
+        let revision = ed.buffer.revision();
+        if revision == self.lsp_rev {
+            return;
+        }
+        let language = ed.language.clone().unwrap_or_else(|| "plaintext".into());
+        let text = ed.buffer.share();
+        if tx
+            .try_send(LspCmd::DidChange {
+                rel,
+                language,
+                revision,
+                text,
+            })
+            .is_ok()
+        {
+            self.lsp_rev = revision;
+        }
+    }
+
+    fn go_to_definition(&mut self, tx: &mut Tx) {
+        let Some(lsp) = &self.lsp_tx else {
+            self.status = Some("No definition.".into());
+            tx.instant();
+            return;
+        };
+        let Some(rel) = self.active_path.clone() else {
+            self.status = Some("No definition.".into());
+            tx.instant();
+            return;
+        };
+        let OpenPage::Editor(ed) = &self.page else {
+            self.status = Some("No definition.".into());
+            tx.instant();
+            return;
+        };
+        let line = ed.buffer.char_to_line(ed.caret) as u32;
+        let start = ed.buffer.line_to_char(line as usize);
+        let character = ed.caret.saturating_sub(start) as u32;
+        if lsp
+            .try_send(LspCmd::Define {
+                rel,
+                line,
+                character,
+            })
+            .is_err()
+        {
+            self.status = Some("No definition.".into());
+        }
+        tx.instant();
+    }
+
     fn request_save(&mut self) -> bool {
         let (Some(project), Some(rel), Some(io_tx)) =
             (self.project.clone(), self.active_path.clone(), &self.io_tx)
@@ -1216,6 +1383,7 @@ impl Pen {
                 self.request_save();
             }
             "Find" => self.open_find(tx),
+            "Go to definition" => self.go_to_definition(tx),
             "Stage file" => {
                 let target = self
                     .active_path
@@ -1433,7 +1601,9 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                 }
             })
         }
-        (_, OpenPage::Editor(ed)) => editor_page_container(ed, &theme),
+        (_, OpenPage::Editor(ed)) => {
+            editor_page_container(ed, &theme, cx.is_reduced_motion(), &s.open_diags)
+        }
     };
 
     let mut page_stack = col()
@@ -1466,7 +1636,9 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         ));
     }
     page_stack = page_stack.child(main_surface);
-    if let Some(status) = &s.status {
+    let diag_note = caret_diag(s);
+    let shown = s.status.clone().or(diag_note);
+    if let Some(status) = shown {
         page_stack = page_stack.child(
             row()
                 .key("pen/status")
@@ -1896,7 +2068,12 @@ fn palette_overlay(s: &Pen, theme: &Theme) -> El {
         .child(col().w_full().items_center().child(card))
 }
 
-fn editor_page_container(ed: &EditorState, theme: &Theme) -> El {
+fn editor_page_container(
+    ed: &EditorState,
+    theme: &Theme,
+    reduced_motion: bool,
+    diags: &[Diag],
+) -> El {
     col()
         .key("pen/page")
         .w_full()
@@ -1931,10 +2108,11 @@ fn editor_page_container(ed: &EditorState, theme: &Theme) -> El {
         .on_paste(|s: &mut Pen, clip: &str, tx: &mut Tx| {
             if let OpenPage::Editor(ed) = &mut s.page {
                 ed.insert_text(clip);
+                s.note_edit();
                 tx.instant();
             }
         })
-        .child(editor_view_themed(ed, theme))
+        .child(editor_view_themed(ed, theme, reduced_motion, diags))
 }
 
 fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
@@ -1982,6 +2160,7 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
                     && let Some(cut) = ed.cut_selection()
                 {
                     tx.copy(cut);
+                    s.note_edit();
                     tx.instant();
                     return true;
                 }
@@ -1998,6 +2177,7 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
         && ed.focused
         && ed.on_key(ev)
     {
+        s.note_edit();
         tx.instant();
         return true;
     }
@@ -2012,6 +2192,7 @@ fn on_ime(s: &mut Pen, ime: &Ime, tx: &mut Tx) -> bool {
         && ed.focused
         && ed.on_ime(ime)
     {
+        s.note_edit();
         tx.instant();
         return true;
     }
@@ -2068,6 +2249,14 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.theme_pref = ThemePref::Ink;
         populate_demo_diff(s, &highlight::ink());
         s.git_panel.mode = SidebarMode::Git;
+    }),
+    ("diagnostics-paper", |s| {
+        s.theme_pref = ThemePref::Paper;
+        populate_demo_editor(s);
+        s.open_diags = vec![Diag {
+            line: 4,
+            message: "unused import".into(),
+        }];
     }),
     ("git-paper", |s| {
         s.theme_pref = ThemePref::Paper;

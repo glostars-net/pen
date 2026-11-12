@@ -9,6 +9,8 @@ pub use ime::*;
 
 use std::collections::VecDeque;
 
+pub use ropey::Rope;
+
 /// Undo entries kept; the oldest drops past this.
 const UNDO_CAP: usize = 256;
 
@@ -36,6 +38,7 @@ pub struct Buffer {
     undo: VecDeque<Edit>,
     redo: Vec<Edit>,
     dirty: bool,
+    revision: u64,
 }
 
 impl Buffer {
@@ -46,6 +49,7 @@ impl Buffer {
             undo: VecDeque::new(),
             redo: Vec::new(),
             dirty: false,
+            revision: 0,
         }
     }
 
@@ -58,6 +62,7 @@ impl Buffer {
             undo: VecDeque::new(),
             redo: Vec::new(),
             dirty: false,
+            revision: 0,
         })
     }
 
@@ -84,7 +89,7 @@ impl Buffer {
             len: text.chars().count(),
         });
         self.redo.clear();
-        self.dirty = true;
+        self.touch();
     }
 
     /// Delete a char range. Pushes one undo entry and clears redo.
@@ -99,7 +104,7 @@ impl Buffer {
             text: removed,
         });
         self.redo.clear();
-        self.dirty = true;
+        self.touch();
     }
 
     /// Apply the newest undo entry. False when there is nothing to undo.
@@ -109,7 +114,7 @@ impl Buffer {
         };
         let inverse = self.apply(edit);
         self.redo.push(inverse);
-        self.dirty = true;
+        self.touch();
         true
     }
 
@@ -120,8 +125,23 @@ impl Buffer {
         };
         let inverse = self.apply(edit);
         self.undo.push_back(inverse);
-        self.dirty = true;
+        self.touch();
         true
+    }
+
+    fn touch(&mut self) {
+        self.dirty = true;
+        self.revision += 1;
+    }
+
+    /// Bumps on insert, delete, undo, and redo. Caret moves do not.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Cheap share of the rope so a worker can stringify off the UI thread.
+    pub fn share(&self) -> ropey::Rope {
+        self.rope.clone()
     }
 
     pub fn text(&self) -> String {
