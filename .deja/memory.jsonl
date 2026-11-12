@@ -1,1 +1,0 @@
-{"id":"8d0ecd21d5","kind":"decision","text":"The fixture string closed early on an inner `\"#`. I'll widen the raw-string delimiter and rerun the spawn test.","files":["Cargo.toml","crates/lsp/src/lib.rs"],"commit":"d0e003a","sessions":1,"date":"2026-11-12","from":"opencode 2026-11-12"}
