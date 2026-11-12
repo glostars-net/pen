@@ -1363,14 +1363,14 @@ impl Pen {
         {
             self.project_parent = PathBuf::from(home).display().to_string();
         }
-        tx.instant();
+        let _ = tx;
     }
 
     fn open_settings(&mut self, tx: &mut Tx) {
         self.new_project_open = false;
         self.settings_open = true;
         self.file_menu_open = false;
-        tx.instant();
+        let _ = tx;
     }
 
     fn close_folder(&mut self, tx: &mut Tx) {
@@ -1800,10 +1800,11 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     cx.focus_ring(1.0, 1.0, fg);
     let k = build_kit(&theme);
 
+    let reduced = cx.is_reduced_motion();
     let main_surface = if s.settings_open {
-        settings_page(s, &theme)
+        settings_page(s, &theme, reduced)
     } else if s.new_project_open {
-        new_project_page(s, &theme)
+        new_project_page(s, &theme, reduced)
     } else {
         match (&s.project, &s.page) {
             (None, OpenPage::Empty) => home_screen(s, &theme),
@@ -2116,10 +2117,17 @@ fn file_menu(s: &Pen, theme: &Theme, k: &rune_kit::Kit, layer: &mut Vec<El>) -> 
         .key("pen/file-trigger")
         .cursor(Cursor::Pointer)
         .transition(Transition::none())
+        .h(32.0)
+        .px(12.0)
+        .radius(6.0)
+        .center()
+        .border(1.0, fg.alpha(0.20))
+        .hover(fg.alpha(0.06))
+        .press(fg.alpha(0.12))
         .on_press_tx(|s: &mut Pen, tx: &mut Tx| {
             s.file_menu_open = !s.file_menu_open;
             s.recent_menu_open = false;
-            tx.instant();
+            let _ = tx;
         })
         .child(text("File").font(UI_FONT).color(fg));
     if s.display_name != "Pen" {
@@ -2141,6 +2149,26 @@ fn file_menu(s: &Pen, theme: &Theme, k: &rune_kit::Kit, layer: &mut Vec<El>) -> 
                     s.prompt_open_folder(tx);
                 }),
         );
+    if s.project.is_some() {
+        menu = menu
+            .item(
+                MenuItem::new("Save")
+                    .shortcut(shortcut_hint("Save").unwrap_or("").to_owned())
+                    .on_select_tx(|s: &mut Pen, tx: &mut Tx| {
+                        s.file_menu_open = false;
+                        s.request_save();
+                        let _ = tx;
+                    }),
+            )
+            .item(
+                MenuItem::new("Find")
+                    .shortcut(shortcut_hint("Find").unwrap_or("").to_owned())
+                    .on_select_tx(|s: &mut Pen, tx: &mut Tx| {
+                        s.file_menu_open = false;
+                        s.open_find(tx);
+                    }),
+            );
+    }
     if !s.recents.is_empty() {
         let entries: Vec<MenuEntry> = s
             .recents
@@ -2193,54 +2221,115 @@ fn file_menu(s: &Pen, theme: &Theme, k: &rune_kit::Kit, layer: &mut Vec<El>) -> 
     menu.open(s.file_menu_open).build(k, layer)
 }
 
-fn settings_page(s: &Pen, theme: &Theme) -> El {
+fn page_motion(reduced: bool) -> Transition {
+    if reduced {
+        Transition::none()
+    } else {
+        Transition::opacity()
+    }
+}
+
+fn back_button(key: &'static str, theme: &Theme) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    row()
+        .key(key)
+        .role("button")
+        .label("Back")
+        .focusable(true)
+        .cursor(Cursor::Pointer)
+        .h(36.0)
+        .px(14.0)
+        .center()
+        .radius(6.0)
+        .fill(bg)
+        .border(1.0, fg.alpha(0.20))
+        .hover(fg.alpha(0.06))
+        .press(fg.alpha(0.12))
+        .transition(Transition::none())
+        .child(text("Back").font(UI_FONT).color(fg))
+}
+
+fn choice_button(key: String, label: &'static str, on: bool, theme: &Theme) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    row()
+        .key(key)
+        .role("button")
+        .label(label)
+        .focusable(true)
+        .cursor(Cursor::Pointer)
+        .h(56.0)
+        .w(200.0)
+        .px(16.0)
+        .center()
+        .radius(6.0)
+        .fill(if on { fg.alpha(0.08) } else { bg })
+        .border(
+            if on { 1.5 } else { 1.0 },
+            if on { fg } else { fg.alpha(0.20) },
+        )
+        .hover(fg.alpha(0.06))
+        .press(fg.alpha(0.12))
+        .transition(Transition::none())
+        .child(text(label).font(UI_MEDIUM_FONT).color(fg))
+}
+
+fn settings_page(s: &Pen, theme: &Theme, reduced: bool) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
     let faint = rgb_color(theme.faint);
-    let choice = |key: &'static str, label: &'static str, on: bool| {
-        row()
-            .key(key)
-            .h(34.0)
-            .center_y()
-            .cursor(Cursor::Pointer)
-            .transition(Transition::none())
-            .child(
-                text(label)
-                    .font(if on { UI_MEDIUM_FONT } else { UI_FONT })
-                    .color(if on { fg } else { faint }),
-            )
-    };
     col()
         .key("pen/settings")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .fill(bg)
-        .pt(48.0)
+        .pt(32.0)
         .pl(48.0)
         .gap(16.0)
-        .transition(Transition::none())
+        .opacity_motion(Spring::new(0.20, 0.0))
+        .transition(page_motion(reduced))
+        .child(
+            row().child(back_button("pen/settings-back", theme).on_press_tx(
+                |s: &mut Pen, tx: &mut Tx| {
+                    s.save_display_name(tx);
+                    s.settings_open = false;
+                },
+            )),
+        )
         .child(text("Settings").font(UI_MEDIUM_FONT).color(fg))
         .child(text("Appearance").font(UI_FONT).color(faint))
         .child(
-            choice(
-                "pen/set-system",
-                "System",
-                matches!(s.theme_pref, ThemePref::System),
-            )
-            .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("system", tx)),
-        )
-        .child(
-            choice("pen/set-ink", "Ink", matches!(s.theme_pref, ThemePref::Ink))
-                .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("ink", tx)),
-        )
-        .child(
-            choice(
-                "pen/set-paper",
-                "Paper",
-                matches!(s.theme_pref, ThemePref::Paper),
-            )
-            .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("paper", tx)),
+            row()
+                .gap(8.0)
+                .child(
+                    choice_button(
+                        "pen/set-system".into(),
+                        "System",
+                        matches!(s.theme_pref, ThemePref::System),
+                        theme,
+                    )
+                    .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("system", tx)),
+                )
+                .child(
+                    choice_button(
+                        "pen/set-ink".into(),
+                        "Ink",
+                        matches!(s.theme_pref, ThemePref::Ink),
+                        theme,
+                    )
+                    .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("ink", tx)),
+                )
+                .child(
+                    choice_button(
+                        "pen/set-paper".into(),
+                        "Paper",
+                        matches!(s.theme_pref, ThemePref::Paper),
+                        theme,
+                    )
+                    .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("paper", tx)),
+                ),
         )
         .child(text("Name").font(UI_FONT).color(faint))
         .child(
@@ -2248,46 +2337,35 @@ fn settings_page(s: &Pen, theme: &Theme) -> El {
                 .key("pen/name")
                 .single_line()
                 .w(280.0)
-                .h(28.0)
+                .h(36.0)
                 .color(fg)
                 .caret(fg, fg.alpha(0.12))
                 .on_edit(|s: &mut Pen| &mut s.name_edit)
                 .on_submit(|s: &mut Pen, tx: &mut Tx| s.save_display_name(tx)),
         )
-        .child(home_button("pen/settings-done", "Done", theme).on_press_tx(
-            |s: &mut Pen, tx: &mut Tx| {
-                s.save_display_name(tx);
-                s.settings_open = false;
-                tx.instant();
-            },
-        ))
 }
 
-fn new_project_page(s: &Pen, theme: &Theme) -> El {
+fn new_project_page(s: &Pen, theme: &Theme, reduced: bool) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
     let faint = rgb_color(theme.faint);
     let rows = scaffold::catalog(|bin| s.bins.iter().any(|have| have == bin));
-    let mut kinds = col().gap(4.0);
+    let mut kinds = col().gap(8.0);
+    let mut row_el = row().gap(8.0);
     for (i, kind) in rows.iter().enumerate() {
         let on = s.project_kind == i;
-        kinds = kinds.child(
-            row()
-                .key(format!("pen/kind-{}", kind.id))
-                .h(34.0)
-                .center_y()
-                .cursor(Cursor::Pointer)
-                .transition(Transition::none())
-                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+        row_el = row_el.child(
+            choice_button(format!("pen/kind-{}", kind.id), kind.label, on, theme).on_press_tx(
+                move |s: &mut Pen, tx: &mut Tx| {
                     s.project_kind = i;
                     tx.instant();
-                })
-                .child(
-                    text(kind.label)
-                        .font(if on { UI_MEDIUM_FONT } else { UI_FONT })
-                        .color(if on { fg } else { faint }),
-                ),
+                },
+            ),
         );
+        if i % 2 == 1 || i + 1 == rows.len() {
+            kinds = kinds.child(row_el);
+            row_el = row().gap(8.0);
+        }
     }
     col()
         .key("pen/new-project-page")
@@ -2295,10 +2373,17 @@ fn new_project_page(s: &Pen, theme: &Theme) -> El {
         .grow(1.0)
         .min_h(0.0)
         .fill(bg)
-        .pt(48.0)
+        .pt(32.0)
         .pl(48.0)
-        .gap(12.0)
-        .transition(Transition::none())
+        .gap(16.0)
+        .opacity_motion(Spring::new(0.20, 0.0))
+        .transition(page_motion(reduced))
+        .child(row().child(back_button("pen/new-back", theme).on_press_tx(
+            |s: &mut Pen, tx: &mut Tx| {
+                s.new_project_open = false;
+                let _ = tx;
+            },
+        )))
         .child(text("New project").font(UI_MEDIUM_FONT).color(fg))
         .child(
             text_input(&s.project_name, UI_FONT)
@@ -2322,13 +2407,17 @@ fn new_project_page(s: &Pen, theme: &Theme) -> El {
             .color(faint),
         )
         .child(
-            home_button("pen/choose-parent", "Choose folder", theme)
-                .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.choose_project_parent(tx)),
+            row().child(
+                home_button("pen/choose-parent", "Choose folder", theme)
+                    .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.choose_project_parent(tx)),
+            ),
         )
         .child(kinds)
         .child(
-            home_button("pen/create", "Create", theme)
-                .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.submit_project(tx)),
+            row().child(
+                home_button("pen/create", "Create", theme)
+                    .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.submit_project(tx)),
+            ),
         )
 }
 
@@ -2747,6 +2836,12 @@ type SceneFn = fn(&mut Pen);
 const SCENES: &[(&str, SceneFn)] = &[
     ("empty-paper", |s| {
         s.theme_pref = ThemePref::Paper;
+    }),
+    ("new-project-paper", |s| {
+        s.theme_pref = ThemePref::Paper;
+        s.new_project_open = true;
+        s.bins = vec!["cargo".into(), "npm".into(), "python3".into()];
+        s.project_parent = "/Users/aj".into();
     }),
     ("home-paper", |s| {
         s.theme_pref = ThemePref::Paper;
