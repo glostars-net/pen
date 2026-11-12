@@ -152,6 +152,12 @@ Gate verified on `rustc 1.99.1` against pinned Rune rev
   - **Monochrome ink-step diff:** confirmed (`theme.added` and `theme.removed` derive from contrast-checked `>= 4.5:1` OKLab ink steps mapped onto `rune_kit::DiffView`, paired with a five-step monochrome `diff_highlighter`; zero green/red diff bars or rainbow syntax).
   - **Tree & Changes status labels:** confirmed (`+n −n` using true minus `U+2212` for tracked modifications and `new` for untracked files in `theme.faint` tabular numerals; no colored status dot).
 
+## Phase 3b
+
+The empty window is a home screen: `Open a folder`, `New project`, and up to eight recent folders that still exist. A `File` menu sits at the leading edge of the toolbar. Settings is a page for appearance and a display name. The file tree uses the ink marks in `assets/icons/files/`. A new project is created from a local catalog; a row is hidden when its tool is not installed. The terminal dock slot exists and is not shown.
+
+With no recent folders, the home screen shows the two actions and no Recent heading.
+
 ## Phase 3
 
 Language servers are optional. Pen ships none. A missing `lsp.json` (next to `theme.json` in the app config dir) starts no process, and the caret still moves. Confirmed by the host treating a missing file as an empty server list, and by `editor_frame` still drawing the caret. This session did not type in a live window.

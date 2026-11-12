@@ -3,12 +3,17 @@
 
 pub mod diagnostics;
 pub mod disk;
+pub mod dock;
 pub mod editor;
+pub mod file_mark;
 pub mod git_guard;
 pub mod git_panel;
 pub mod goto;
 pub mod lsp_host;
 pub mod palette;
+pub mod recents;
+pub mod scaffold;
+pub mod settings;
 pub mod theme_kit;
 
 /// Bundled OFL faces (IBM Plex Sans for chrome, IBM Plex Mono for code).

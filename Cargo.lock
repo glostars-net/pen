@@ -3599,6 +3599,7 @@ dependencies = [
  "project",
  "rune",
  "rune-kit",
+ "serde_json",
  "tokio",
 ]
 

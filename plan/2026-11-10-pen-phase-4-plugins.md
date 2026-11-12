@@ -17,7 +17,7 @@
 - Host imports are `register-command` and `register-theme` only. No file, env, clock, or random WASI.
 - Theme JSON from a plugin goes through `pen_highlight::load_theme`. A failed load skips that theme. It does not replace Ink or Paper.
 - A plugin trap is reported as "Plugin {name} stopped." The editor keeps running.
-- Command names that collide with a built-in are rejected. Built-ins stay `Open folder`, `Save`, `Find`, `Use Ink`, `Use Paper`.
+- Command names that collide with any current `BUILTIN_COMMANDS` entry are rejected, not only the original five.
 - Fuel limit: 1_000_000 instructions per call. Exceeding it is a trap, not a hang.
 - No UI widgets from WASM. A plugin that wants a view is out of scope.
 
@@ -251,7 +251,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-Expected: all clean. Launch Pen with an empty plugins directory. Record in the README that the palette still lists the five built-ins and nothing else.
+Expected: all clean. Launch Pen with an empty plugins directory. Record in the README that the palette gained no rows.
 
 - [ ] **Step 2: Commit**
 

@@ -14,7 +14,9 @@ use buffer::Buffer;
 use highlight::{Theme, lang_for_path, load_theme};
 use pen::diagnostics::{self, Diag};
 use pen::disk::{DiskEvent, on_disk_change};
+use pen::dock::{self, DockId};
 use pen::editor::{CODE_SIZE, EditorState, LINE_H, editor_view_themed};
+use pen::file_mark::{mark_for, mark_icon};
 use pen::git_guard::{CheckoutDecision, decide_checkout};
 use pen::git_panel::{
     GitPanelState, GitSnapshot, PendingConfirm, SidebarMode, branches_section, changes_section,
@@ -23,6 +25,9 @@ use pen::git_panel::{
 };
 use pen::lsp_host::{self, LspCmd, LspEvent};
 use pen::palette::{BUILTIN_COMMANDS, filter_command_list, shortcut_hint};
+use pen::recents::{self, from_json, to_json};
+use pen::scaffold::{self, reject_name};
+use pen::settings::parse_name;
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, diff_highlighter, rgb_color};
 use project::watch::{ProjectWatcher, WatchEvent, watch_project_with};
 use project::{FileEntry, Project, ReadFile};
@@ -34,7 +39,7 @@ use rune::{
 };
 use rune_kit::diff::{DiffMode, DiffState, parse as parse_diff};
 use rune_kit::shell::{self, PaneMotion, PaneState, SplitView, Toolbar};
-use rune_kit::{FileNode, FileTree, Tree, TreeItem, TreeModel};
+use rune_kit::{FileNode, FileTree, Menu, MenuEntry, MenuItem, Tree, TreeItem, TreeModel};
 use tokio::sync::{mpsc, watch};
 
 /// Git status refreshes at most this often (Task 2): a burst of triggers
@@ -96,6 +101,13 @@ enum IoCmd {
         bytes: Vec<u8>,
     },
     SaveThemePref(&'static str),
+    SaveRecents(Vec<PathBuf>),
+    SaveName(String),
+    CreateProject {
+        parent: PathBuf,
+        name: String,
+        kind: String,
+    },
     DiffWorktree {
         root: PathBuf,
         rel: PathBuf,
@@ -142,7 +154,11 @@ enum IoMsg {
     PrefsLoaded {
         theme_pref: ThemePref,
         first_launch: bool,
+        recents: Vec<PathBuf>,
+        name: String,
+        bins: Vec<String>,
     },
+    ProjectCreated(PathBuf),
     ProjectListed {
         project: Project,
         entries: Vec<FileEntry>,
@@ -215,6 +231,17 @@ struct Pen {
     lsp_rx: Option<std::sync::mpsc::Receiver<LspEvent>>,
     lsp_rev: u64,
     pending_jump: Option<(PathBuf, usize)>,
+    recents: Vec<PathBuf>,
+    display_name: String,
+    bins: Vec<String>,
+    file_menu_open: bool,
+    recent_menu_open: bool,
+    settings_open: bool,
+    new_project_open: bool,
+    project_name: TextEdit,
+    project_parent: String,
+    project_kind: usize,
+    name_edit: TextEdit,
 }
 
 fn init() -> Pen {
@@ -253,6 +280,17 @@ fn init() -> Pen {
         lsp_rx: None,
         lsp_rev: 0,
         pending_jump: None,
+        recents: Vec::new(),
+        display_name: "Pen".into(),
+        bins: Vec::new(),
+        file_menu_open: false,
+        recent_menu_open: false,
+        settings_open: false,
+        new_project_open: false,
+        project_name: TextEdit::new(""),
+        project_parent: String::new(),
+        project_kind: 0,
+        name_edit: TextEdit::new("Pen"),
     }
 }
 
@@ -326,14 +364,22 @@ fn setup(s: &mut Pen, waker: Waker) {
                 });
 
                 if !headless {
-                    let (theme_pref, first_launch) =
-                        tokio::task::spawn_blocking(read_startup_prefs_blocking)
-                            .await
-                            .unwrap_or((ThemePref::System, false));
+                    let prefs = tokio::task::spawn_blocking(read_startup_prefs_blocking)
+                        .await
+                        .unwrap_or_else(|_| StartupPrefs {
+                            theme_pref: ThemePref::System,
+                            first_launch: false,
+                            recents: Vec::new(),
+                            name: "Pen".into(),
+                            bins: Vec::new(),
+                        });
                     let _ = msg_tx
                         .send(IoMsg::PrefsLoaded {
-                            theme_pref,
-                            first_launch,
+                            theme_pref: prefs.theme_pref,
+                            first_launch: prefs.first_launch,
+                            recents: prefs.recents,
+                            name: prefs.name,
+                            bins: prefs.bins,
                         })
                         .await;
                     waker();
@@ -436,6 +482,26 @@ fn setup(s: &mut Pen, waker: Waker) {
                             })
                             .await;
                             continue;
+                        }
+                        IoCmd::SaveRecents(list) => {
+                            let _ =
+                                tokio::task::spawn_blocking(move || write_recents_blocking(&list))
+                                    .await;
+                            continue;
+                        }
+                        IoCmd::SaveName(name) => {
+                            let _ = tokio::task::spawn_blocking(move || write_name_blocking(&name))
+                                .await;
+                            continue;
+                        }
+                        IoCmd::CreateProject { parent, name, kind } => {
+                            tokio::task::spawn_blocking(move || {
+                                scaffold::create(&parent, &name, &kind)
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                            .map_or_else(IoMsg::Error, IoMsg::ProjectCreated)
                         }
                         IoCmd::DiffWorktree { root, rel } => {
                             tokio::task::spawn_blocking(move || {
@@ -722,8 +788,15 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
             IoMsg::PrefsLoaded {
                 theme_pref,
                 first_launch,
+                recents,
+                name,
+                bins,
             } => {
                 s.theme_pref = theme_pref;
+                s.recents = recents;
+                s.display_name = name.clone();
+                s.name_edit = TextEdit::new(&name);
+                s.bins = bins;
                 if first_launch && s.project.is_none() {
                     s.page_opacity = 0.0;
                     s.reveal_first_launch = true;
@@ -739,6 +812,10 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 watch_rx,
             } => {
                 s.files = build_file_tree(entries);
+                s.recents = recents::remember(&s.recents, &project.root);
+                if let Some(io_tx) = &s.io_tx {
+                    let _ = io_tx.try_send(IoCmd::SaveRecents(s.recents.clone()));
+                }
                 s.project = Some(project);
                 s.watch_rx = watch_rx;
                 s.active_path = None;
@@ -891,6 +968,14 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                     s.git_panel.worktree_branch.clear();
                 }
                 s.status = Some(note);
+                tx.instant();
+            }
+            IoMsg::ProjectCreated(path) => {
+                s.new_project_open = false;
+                s.project_name = TextEdit::new("");
+                if let Some(io_tx) = &s.io_tx {
+                    let _ = io_tx.try_send(IoCmd::OpenProject(path));
+                }
                 tx.instant();
             }
             IoMsg::Error(err) => {
@@ -1269,6 +1354,103 @@ impl Pen {
         true
     }
 
+    fn open_new_project(&mut self, tx: &mut Tx) {
+        self.settings_open = false;
+        self.new_project_open = true;
+        self.file_menu_open = false;
+        if self.project_parent.is_empty()
+            && let Some(home) = std::env::var_os("HOME")
+        {
+            self.project_parent = PathBuf::from(home).display().to_string();
+        }
+        tx.instant();
+    }
+
+    fn open_settings(&mut self, tx: &mut Tx) {
+        self.new_project_open = false;
+        self.settings_open = true;
+        self.file_menu_open = false;
+        tx.instant();
+    }
+
+    fn close_folder(&mut self, tx: &mut Tx) {
+        self.stash_current_if_dirty();
+        self.project = None;
+        self.active_path = None;
+        self.page = OpenPage::Empty;
+        self.git_status = GitSnapshot::default();
+        self.settings_open = false;
+        self.new_project_open = false;
+        if self.sidebar.is_open() {
+            self.sidebar.toggle();
+        }
+        tx.instant();
+    }
+
+    fn set_appearance(&mut self, choice: &'static str, tx: &mut Tx) {
+        self.theme_pref = match choice {
+            "ink" => ThemePref::Ink,
+            "paper" => ThemePref::Paper,
+            _ => ThemePref::System,
+        };
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::SaveThemePref(choice));
+        }
+        tx.instant();
+    }
+
+    fn save_display_name(&mut self, tx: &mut Tx) {
+        let name = parse_name(&self.name_edit.text);
+        self.display_name = name.clone();
+        self.name_edit = TextEdit::new(&name);
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::SaveName(name));
+        }
+        tx.instant();
+    }
+
+    fn choose_project_parent(&mut self, tx: &mut Tx) {
+        let options = FileDialogOptions {
+            title: "Choose a folder".into(),
+            directory: None,
+            file_name: None,
+            filters: Vec::new(),
+        };
+        tx.open_folder(options, |s: &mut Pen, result, tx| {
+            if let Ok(Some(path)) = result {
+                s.project_parent = path.display().to_string();
+            }
+            tx.instant();
+        });
+    }
+
+    fn submit_project(&mut self, tx: &mut Tx) {
+        if reject_name(&self.project_name.text) {
+            self.status = Some("Name the project.".into());
+            tx.instant();
+            return;
+        }
+        if self.project_parent.is_empty() {
+            self.status = Some("Choose a folder.".into());
+            tx.instant();
+            return;
+        }
+        let rows = scaffold::catalog(|bin| self.bins.iter().any(|have| have == bin));
+        let Some(kind) = rows.get(self.project_kind) else {
+            self.status = Some("Choose a project kind.".into());
+            tx.instant();
+            return;
+        };
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::CreateProject {
+                parent: PathBuf::from(&self.project_parent),
+                name: self.project_name.text.trim().to_owned(),
+                kind: kind.id.to_owned(),
+            });
+        }
+        tx.instant();
+    }
+
     fn prompt_open_folder(&mut self, tx: &mut Tx) {
         let options = FileDialogOptions {
             title: "Open a folder".into(),
@@ -1498,12 +1680,26 @@ fn tree_label(n: &FileNode<PathBuf>) -> &str {
     n.label()
 }
 
+struct StartupPrefs {
+    theme_pref: ThemePref,
+    first_launch: bool,
+    recents: Vec<PathBuf>,
+    name: String,
+    bins: Vec<String>,
+}
+
 /// Startup preferences read on the Tokio worker: theme choice (`theme` or
 /// `theme.json`) and the one-shot `launched` marker for the 200ms first-launch
 /// page fade.
-fn read_startup_prefs_blocking() -> (ThemePref, bool) {
+fn read_startup_prefs_blocking() -> StartupPrefs {
     let Some(dirs) = AppDirs::new("pen") else {
-        return (ThemePref::System, false);
+        return StartupPrefs {
+            theme_pref: ThemePref::System,
+            first_launch: false,
+            recents: Vec::new(),
+            name: "Pen".into(),
+            bins: Vec::new(),
+        };
     };
     let cfg = dirs.config();
     let launched_file = cfg.join("launched");
@@ -1511,15 +1707,39 @@ fn read_startup_prefs_blocking() -> (ThemePref, bool) {
     if first_launch && std::fs::create_dir_all(cfg).is_ok() {
         let _ = std::fs::write(&launched_file, b"1\n");
     }
+    let recents = std::fs::read_to_string(cfg.join("recents.json"))
+        .map(|raw| recents::still_there(&from_json(&raw), |p| p.exists()))
+        .unwrap_or_default();
+    let name = std::fs::read_to_string(cfg.join("name"))
+        .map(|raw| parse_name(&raw))
+        .unwrap_or_else(|_| "Pen".into());
+    let bins = ["cargo", "npm", "python3"]
+        .into_iter()
+        .filter(|bin| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+        .map(str::to_owned)
+        .collect();
 
     let custom_json = cfg.join("theme.json");
     if let Ok(raw) = std::fs::read_to_string(custom_json)
         && let Ok(theme) = load_theme(&raw)
     {
-        return (ThemePref::Custom(Box::new(theme)), first_launch);
+        return StartupPrefs {
+            theme_pref: ThemePref::Custom(Box::new(theme)),
+            first_launch,
+            recents,
+            name,
+            bins,
+        };
     }
     let choice_path = cfg.join("theme");
-    let pref = match std::fs::read_to_string(choice_path)
+    let theme_pref = match std::fs::read_to_string(choice_path)
         .ok()
         .as_deref()
         .map(str::trim)
@@ -1528,7 +1748,33 @@ fn read_startup_prefs_blocking() -> (ThemePref, bool) {
         Some("paper") => ThemePref::Paper,
         _ => ThemePref::System,
     };
-    (pref, first_launch)
+    StartupPrefs {
+        theme_pref,
+        first_launch,
+        recents,
+        name,
+        bins,
+    }
+}
+
+fn write_recents_blocking(list: &[PathBuf]) {
+    let Some(dirs) = AppDirs::new("pen") else {
+        return;
+    };
+    let cfg = dirs.config();
+    if std::fs::create_dir_all(cfg).is_ok() {
+        let _ = std::fs::write(cfg.join("recents.json"), to_json(list));
+    }
+}
+
+fn write_name_blocking(name: &str) {
+    let Some(dirs) = AppDirs::new("pen") else {
+        return;
+    };
+    let cfg = dirs.config();
+    if std::fs::create_dir_all(cfg).is_ok() {
+        let _ = std::fs::write(cfg.join("name"), name);
+    }
 }
 
 fn write_theme_pref_blocking(choice: &str) {
@@ -1554,55 +1800,61 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     cx.focus_ring(1.0, 1.0, fg);
     let k = build_kit(&theme);
 
-    let main_surface = match (&s.project, &s.page) {
-        (None, OpenPage::Empty) => empty_folder_screen(s, &theme),
-        (_, OpenPage::Empty) => col()
-            .key("pen/page-blank")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .fill(bg)
-            .transition(Transition::none()),
-        (_, OpenPage::Notice(msg)) => col()
-            .key("pen/notice")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .fill(bg)
-            .center()
-            .transition(Transition::none())
-            .child(text(msg.clone()).font(UI_FONT).color(faint)),
-        (_, OpenPage::Diff { title }) => {
-            let resolved_theme = theme.clone();
-            diff_page_view(
-                s,
-                title,
-                &theme,
-                &k,
-                |s: &Pen| &s.diff_state,
-                |s: &mut Pen| &mut s.diff_state,
-                |s: &mut Pen, tx: &mut Tx| {
-                    let next = match s.diff_state.mode() {
-                        DiffMode::Unified => DiffMode::Split,
-                        DiffMode::Split => DiffMode::Unified,
-                    };
-                    s.diff_state.set_mode(next);
-                    tx.instant();
-                },
-            )
-            .on_layout_tx(move |s: &mut Pen, _r: [f32; 4], tx: &mut Tx| {
-                if s.diff_theme_bg != resolved_theme.bg {
-                    s.diff_theme_bg = resolved_theme.bg;
-                    s.diff_state
-                        .set_highlighter(diff_highlighter(&resolved_theme));
-                    tx.instant();
-                } else {
-                    tx.live_only();
-                }
-            })
-        }
-        (_, OpenPage::Editor(ed)) => {
-            editor_page_container(ed, &theme, cx.is_reduced_motion(), &s.open_diags)
+    let main_surface = if s.settings_open {
+        settings_page(s, &theme)
+    } else if s.new_project_open {
+        new_project_page(s, &theme)
+    } else {
+        match (&s.project, &s.page) {
+            (None, OpenPage::Empty) => home_screen(s, &theme),
+            (_, OpenPage::Empty) => col()
+                .key("pen/page-blank")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .fill(bg)
+                .transition(Transition::none()),
+            (_, OpenPage::Notice(msg)) => col()
+                .key("pen/notice")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .fill(bg)
+                .center()
+                .transition(Transition::none())
+                .child(text(msg.clone()).font(UI_FONT).color(faint)),
+            (_, OpenPage::Diff { title }) => {
+                let resolved_theme = theme.clone();
+                diff_page_view(
+                    s,
+                    title,
+                    &theme,
+                    &k,
+                    |s: &Pen| &s.diff_state,
+                    |s: &mut Pen| &mut s.diff_state,
+                    |s: &mut Pen, tx: &mut Tx| {
+                        let next = match s.diff_state.mode() {
+                            DiffMode::Unified => DiffMode::Split,
+                            DiffMode::Split => DiffMode::Unified,
+                        };
+                        s.diff_state.set_mode(next);
+                        tx.instant();
+                    },
+                )
+                .on_layout_tx(move |s: &mut Pen, _r: [f32; 4], tx: &mut Tx| {
+                    if s.diff_theme_bg != resolved_theme.bg {
+                        s.diff_theme_bg = resolved_theme.bg;
+                        s.diff_state
+                            .set_highlighter(diff_highlighter(&resolved_theme));
+                        tx.instant();
+                    } else {
+                        tx.live_only();
+                    }
+                })
+            }
+            (_, OpenPage::Editor(ed)) => {
+                editor_page_container(ed, &theme, cx.is_reduced_motion(), &s.open_diags)
+            }
         }
     };
 
@@ -1653,7 +1905,9 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         );
     }
 
-    let mut toolbar = Toolbar::new().title("Pen");
+    let mut menu_layer = Vec::new();
+    let file = file_menu(s, &theme, &k, &mut menu_layer);
+    let mut toolbar = Toolbar::new().title("Pen").leading(file);
     if let Some(rel) = &s.active_path {
         let dirty = matches!(&s.page, OpenPage::Editor(ed) if ed.buffer.is_dirty());
         let label = if dirty {
@@ -1685,7 +1939,12 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
             let tree = Tree::new(|s: &Pen| &s.files, |s: &mut Pen| &mut s.files, tree_label)
                 .name("Files")
                 .row(move |node, r| {
-                    let item = TreeItem::file(node, r);
+                    let mark = if node.dir {
+                        pen::file_mark::FileMark::Folder
+                    } else {
+                        mark_for(std::path::Path::new(&node.name), false)
+                    };
+                    let item = TreeItem::file(node, r).icon(mark_icon(mark)).icon_color(fg);
                     match node.data.as_ref().and_then(|rel| git_labels.get(rel)) {
                         Some(lbl) => item.badge(lbl.clone()),
                         None => item,
@@ -1808,23 +2067,27 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                         .color(if active { fg } else { faint }),
                 )
         };
-        sidebar = sidebar.child(
-            row()
-                .key("pen/sidebar-tabs")
-                .w_full()
-                .h(36.0)
-                .px(8.0)
-                .gap(4.0)
-                .center_y()
-                .border_sides([0.0, 0.0, 1.0, 0.0], rule)
-                .child(tab(
+        let mut tabs = row()
+            .key("pen/sidebar-tabs")
+            .w_full()
+            .h(36.0)
+            .px(8.0)
+            .gap(4.0)
+            .center_y()
+            .border_sides([0.0, 0.0, 1.0, 0.0], rule);
+        for dock in dock::visible_docks(true) {
+            tabs = match dock {
+                DockId::Files => tabs.child(tab(
                     "pen/tab-files",
                     "Files",
                     files_active,
                     SidebarMode::Files,
-                ))
-                .child(tab("pen/tab-git", "Git", git_active, SidebarMode::Git)),
-        );
+                )),
+                DockId::Git => tabs.child(tab("pen/tab-git", "Git", git_active, SidebarMode::Git)),
+                DockId::Terminal => tabs,
+            };
+        }
+        sidebar = sidebar.child(tabs);
     }
     sidebar = sidebar.child(sidebar_body);
 
@@ -1839,18 +2102,243 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         split = split.hide_sidebar_toggle();
     }
     let shell_el = split.build(&k);
-    rune_kit::root(shell_el, s.palette_open.then(|| palette_overlay(s, &theme)))
+    let mut overlays = menu_layer;
+    if s.palette_open {
+        overlays.push(palette_overlay(s, &theme));
+    }
+    rune_kit::root(shell_el, overlays)
 }
 
-/// Empty state: "Open a folder" centered alone on the page. First launch only
-/// fades opacity over 200 ms; every later launch is instant.
-fn empty_folder_screen(s: &Pen, theme: &Theme) -> El {
+fn file_menu(s: &Pen, theme: &Theme, k: &rune_kit::Kit, layer: &mut Vec<El>) -> El {
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let mut trigger = col()
+        .key("pen/file-trigger")
+        .cursor(Cursor::Pointer)
+        .transition(Transition::none())
+        .on_press_tx(|s: &mut Pen, tx: &mut Tx| {
+            s.file_menu_open = !s.file_menu_open;
+            s.recent_menu_open = false;
+            tx.instant();
+        })
+        .child(text("File").font(UI_FONT).color(fg));
+    if s.display_name != "Pen" {
+        trigger = trigger.child(text(s.display_name.clone()).font(UI_FONT).color(faint));
+    }
+    let mut menu = Menu::new("pen/file")
+        .trigger(trigger)
+        .item(
+            MenuItem::new("New project").on_select_tx(|s: &mut Pen, tx: &mut Tx| {
+                s.file_menu_open = false;
+                s.open_new_project(tx);
+            }),
+        )
+        .item(
+            MenuItem::new("Open folder")
+                .shortcut(shortcut_hint("Open folder").unwrap_or("").to_owned())
+                .on_select_tx(|s: &mut Pen, tx: &mut Tx| {
+                    s.file_menu_open = false;
+                    s.prompt_open_folder(tx);
+                }),
+        );
+    if !s.recents.is_empty() {
+        let entries: Vec<MenuEntry> = s
+            .recents
+            .iter()
+            .map(|path| {
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let open_path = path.clone();
+                MenuEntry::item(MenuItem::new(label).on_select_tx(
+                    move |s: &mut Pen, tx: &mut Tx| {
+                        s.file_menu_open = false;
+                        s.recent_menu_open = false;
+                        if let Some(io_tx) = &s.io_tx {
+                            let _ = io_tx.try_send(IoCmd::OpenProject(open_path.clone()));
+                        }
+                        tx.instant();
+                    },
+                ))
+            })
+            .collect();
+        menu = menu.item(
+            MenuItem::new("Open recent")
+                .submenu(entries, s.recent_menu_open)
+                .on_select_tx(|s: &mut Pen, tx: &mut Tx| {
+                    s.recent_menu_open = !s.recent_menu_open;
+                    tx.instant();
+                }),
+        );
+    }
+    menu = menu
+        .separator()
+        .item(
+            MenuItem::new("Settings").on_select_tx(|s: &mut Pen, tx: &mut Tx| {
+                s.file_menu_open = false;
+                s.open_settings(tx);
+            }),
+        );
+    if s.project.is_some() {
+        menu = menu
+            .separator()
+            .item(
+                MenuItem::new("Close folder").on_select_tx(|s: &mut Pen, tx: &mut Tx| {
+                    s.file_menu_open = false;
+                    s.close_folder(tx);
+                }),
+            );
+    }
+    menu.open(s.file_menu_open).build(k, layer)
+}
+
+fn settings_page(s: &Pen, theme: &Theme) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
-    let open_btn = row()
-        .key("pen/open-folder")
+    let faint = rgb_color(theme.faint);
+    let choice = |key: &'static str, label: &'static str, on: bool| {
+        row()
+            .key(key)
+            .h(34.0)
+            .center_y()
+            .cursor(Cursor::Pointer)
+            .transition(Transition::none())
+            .child(
+                text(label)
+                    .font(if on { UI_MEDIUM_FONT } else { UI_FONT })
+                    .color(if on { fg } else { faint }),
+            )
+    };
+    col()
+        .key("pen/settings")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(bg)
+        .pt(48.0)
+        .pl(48.0)
+        .gap(16.0)
+        .transition(Transition::none())
+        .child(text("Settings").font(UI_MEDIUM_FONT).color(fg))
+        .child(text("Appearance").font(UI_FONT).color(faint))
+        .child(
+            choice(
+                "pen/set-system",
+                "System",
+                matches!(s.theme_pref, ThemePref::System),
+            )
+            .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("system", tx)),
+        )
+        .child(
+            choice("pen/set-ink", "Ink", matches!(s.theme_pref, ThemePref::Ink))
+                .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("ink", tx)),
+        )
+        .child(
+            choice(
+                "pen/set-paper",
+                "Paper",
+                matches!(s.theme_pref, ThemePref::Paper),
+            )
+            .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("paper", tx)),
+        )
+        .child(text("Name").font(UI_FONT).color(faint))
+        .child(
+            text_input(&s.name_edit, UI_FONT)
+                .key("pen/name")
+                .single_line()
+                .w(280.0)
+                .h(28.0)
+                .color(fg)
+                .caret(fg, fg.alpha(0.12))
+                .on_edit(|s: &mut Pen| &mut s.name_edit)
+                .on_submit(|s: &mut Pen, tx: &mut Tx| s.save_display_name(tx)),
+        )
+        .child(home_button("pen/settings-done", "Done", theme).on_press_tx(
+            |s: &mut Pen, tx: &mut Tx| {
+                s.save_display_name(tx);
+                s.settings_open = false;
+                tx.instant();
+            },
+        ))
+}
+
+fn new_project_page(s: &Pen, theme: &Theme) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let rows = scaffold::catalog(|bin| s.bins.iter().any(|have| have == bin));
+    let mut kinds = col().gap(4.0);
+    for (i, kind) in rows.iter().enumerate() {
+        let on = s.project_kind == i;
+        kinds = kinds.child(
+            row()
+                .key(format!("pen/kind-{}", kind.id))
+                .h(34.0)
+                .center_y()
+                .cursor(Cursor::Pointer)
+                .transition(Transition::none())
+                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+                    s.project_kind = i;
+                    tx.instant();
+                })
+                .child(
+                    text(kind.label)
+                        .font(if on { UI_MEDIUM_FONT } else { UI_FONT })
+                        .color(if on { fg } else { faint }),
+                ),
+        );
+    }
+    col()
+        .key("pen/new-project-page")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(bg)
+        .pt(48.0)
+        .pl(48.0)
+        .gap(12.0)
+        .transition(Transition::none())
+        .child(text("New project").font(UI_MEDIUM_FONT).color(fg))
+        .child(
+            text_input(&s.project_name, UI_FONT)
+                .key("pen/project-name")
+                .single_line()
+                .placeholder("Name", faint)
+                .w(320.0)
+                .h(28.0)
+                .color(fg)
+                .caret(fg, fg.alpha(0.12))
+                .on_edit(|s: &mut Pen| &mut s.project_name)
+                .on_submit(|s: &mut Pen, tx: &mut Tx| s.submit_project(tx)),
+        )
+        .child(
+            text(if s.project_parent.is_empty() {
+                "Choose a folder".into()
+            } else {
+                s.project_parent.clone()
+            })
+            .font(UI_FONT)
+            .color(faint),
+        )
+        .child(
+            home_button("pen/choose-parent", "Choose folder", theme)
+                .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.choose_project_parent(tx)),
+        )
+        .child(kinds)
+        .child(
+            home_button("pen/create", "Create", theme)
+                .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.submit_project(tx)),
+        )
+}
+
+fn home_button(key: &'static str, label: &'static str, theme: &Theme) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    row()
+        .key(key)
         .role("button")
-        .label("Open a folder")
+        .label(label)
         .focusable(true)
         .cursor(Cursor::Pointer)
         .h(40.0)
@@ -1862,20 +2350,74 @@ fn empty_folder_screen(s: &Pen, theme: &Theme) -> El {
         .hover(fg.alpha(0.06))
         .press(fg.alpha(0.12))
         .transition(Transition::none())
-        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.prompt_open_folder(tx))
-        .child(text("Open a folder").font(UI_MEDIUM_FONT).color(fg));
+        .child(text(label).font(UI_MEDIUM_FONT).color(fg))
+}
 
-    col()
-        .key("pen/empty")
+/// Home screen. Replaces the lone "Open a folder" control.
+fn home_screen(s: &Pen, theme: &Theme) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let rule = fg.alpha(0.20);
+    let open = home_button("pen/open-folder", "Open a folder", theme)
+        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.prompt_open_folder(tx));
+    let new_project = home_button("pen/new-project", "New project", theme)
+        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.open_new_project(tx));
+    let mut page = col()
+        .key("pen/home")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .fill(bg)
         .center()
+        .gap(16.0)
         .opacity(s.page_opacity)
         .opacity_motion(Spring::new(0.20, 0.0))
         .transition(Transition::none())
-        .child(open_btn)
+        .child(text("Pen").font(UI_MEDIUM_FONT).color(fg))
+        .child(
+            text("Open a folder, or start a new one.")
+                .font(UI_FONT)
+                .color(faint),
+        )
+        .child(row().gap(8.0).child(open).child(new_project));
+    if !s.recents.is_empty() {
+        let mut list = col().key("pen/recents").w(440.0).gap(0.0);
+        list = list.child(text("Recent").font(UI_FONT).color(faint));
+        for (i, path) in s.recents.iter().enumerate() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let parent = path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let open_path = path.clone();
+            list = list.child(
+                row()
+                    .key(format!("pen/recent-{i}"))
+                    .w_full()
+                    .h(34.0)
+                    .px(0.0)
+                    .center_y()
+                    .gap(12.0)
+                    .border_sides([0.0, 0.0, 1.0, 0.0], rule)
+                    .cursor(Cursor::Pointer)
+                    .transition(Transition::none())
+                    .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+                        if let Some(io_tx) = &s.io_tx {
+                            let _ = io_tx.try_send(IoCmd::OpenProject(open_path.clone()));
+                        }
+                        tx.instant();
+                    })
+                    .child(text(name).font(UI_FONT).color(fg))
+                    .child(text(parent).font(UI_FONT).color(faint)),
+            );
+        }
+        page = page.child(list);
+    }
+    page
 }
 
 /// Single-line Find bar pinned directly above the writing surface (never a dialog).
@@ -2205,6 +2747,13 @@ type SceneFn = fn(&mut Pen);
 const SCENES: &[(&str, SceneFn)] = &[
     ("empty-paper", |s| {
         s.theme_pref = ThemePref::Paper;
+    }),
+    ("home-paper", |s| {
+        s.theme_pref = ThemePref::Paper;
+        s.recents = vec![
+            PathBuf::from("/Users/aj/Developer/projects/pen"),
+            PathBuf::from("/Users/aj/notes"),
+        ];
     }),
     ("empty-ink", |s| {
         s.theme_pref = ThemePref::Ink;
