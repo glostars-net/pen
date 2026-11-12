@@ -54,6 +54,8 @@ pub struct Theme {
     pub added: Rgb,
     pub removed: Rgb,
     pub syntax: [Rgb; 5],
+    /// Set only when `theme.json` supplies `diagnostic` at >= 4.5:1.
+    pub diagnostic: Option<Rgb>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +78,8 @@ struct RawTheme {
     added: Option<String>,
     #[serde(default)]
     removed: Option<String>,
+    #[serde(default)]
+    diagnostic: Option<String>,
     #[serde(default)]
     syntax: Option<Vec<String>>,
 }
@@ -163,6 +167,11 @@ pub fn load_theme(json: &str) -> Result<Theme, ThemeError> {
     {
         removed = r;
     }
+    let diagnostic = raw
+        .diagnostic
+        .as_deref()
+        .and_then(Rgb::try_from_hex)
+        .filter(|c| contrast_ratio(*c, bg) >= MIN_CONTRAST);
 
     Ok(Theme {
         name,
@@ -173,6 +182,7 @@ pub fn load_theme(json: &str) -> Result<Theme, ThemeError> {
         added,
         removed,
         syntax,
+        diagnostic,
     })
 }
 
@@ -355,6 +365,18 @@ mod tests {
         assert_ne!(t.removed, Rgb::from_hex("#f2f2f2"));
         assert!(contrast_ratio(t.added, t.bg) >= 4.5);
         assert!(contrast_ratio(t.removed, t.bg) >= 4.5);
+    }
+
+    #[test]
+    fn low_contrast_diagnostic_is_dropped() {
+        let t =
+            load_theme(r##"{"name":"x","bg":"#ffffff","fg":"#111111","diagnostic":"#eeeeee"}"##)
+                .unwrap();
+        assert!(t.diagnostic.is_none());
+        let kept =
+            load_theme(r##"{"name":"x","bg":"#ffffff","fg":"#111111","diagnostic":"#111111"}"##)
+                .unwrap();
+        assert_eq!(kept.diagnostic, Some(Rgb::from_hex("#111111")));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use rune::{
     col, el, row, text,
 };
 
+use crate::diagnostics::{self, Diag};
 use crate::theme_kit::rgb_color;
 
 /// Code size in points (Design: 13px, line-height 1.55, tracking 0).
@@ -498,10 +499,15 @@ impl EditorState {
 /// Draw the editor page from `state`. Pure function of `&EditorState`: reads
 /// and highlights only `viewport(first_line, visible + OVERSCAN_LINES)`.
 pub fn editor_view(state: &EditorState) -> El {
-    editor_view_themed(state, &state.theme)
+    editor_view_themed(state, &state.theme, false, &[])
 }
 
-pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
+pub fn editor_view_themed(
+    state: &EditorState,
+    theme: &Theme,
+    reduced_motion: bool,
+    diags: &[Diag],
+) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
     let faint = rgb_color(theme.faint);
@@ -522,11 +528,17 @@ pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
     let selection = state.selection();
     let num_w = state.line_number_width();
 
+    let override_hex = theme
+        .diagnostic
+        .map(|c| format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2));
+    let ink = diagnostics::underline_color(theme, override_hex.as_deref());
     let mut rows = col()
         .key("pen/rows")
         .w_full()
         .pt(PAGE_TOP_PAD)
-        .offset(0.0, sub_y);
+        .offset(0.0, sub_y)
+        .instant_changes()
+        .transition(Transition::none());
     for (row_pos, slice) in window.iter().enumerate() {
         let i = slice.line_idx;
         let line_start = state.buffer.line_to_char(i);
@@ -658,15 +670,49 @@ pub fn editor_view_themed(state: &EditorState, theme: &Theme) -> El {
         body = body.child(rail);
     }
 
-    col()
+    let mut page = col()
         .key("pen/editor")
         .w_full()
         .h_full()
         .fill(bg)
         .clip_rounded(0.0)
-        .instant_changes()
         .transition(Transition::none())
-        .child(body)
+        .child(body);
+
+    // Arrival fades. Position stays put: scroll and typing are instant.
+    let visible: Vec<&Diag> = diags
+        .iter()
+        .filter(|d| d.line >= first_line && d.line < first_line + window.len())
+        .collect();
+    if !visible.is_empty() {
+        let mut layer = el()
+            .key("pen/diags")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .transition(diagnostics::diag_transition(reduced_motion));
+        let x = state.code_left();
+        for diag in visible {
+            let row = diag.line - first_line;
+            let width = window
+                .get(row)
+                .map(|slice| {
+                    visual_col(&slice.text, slice.text.chars().count()) as f32 * CHAR_ADVANCE
+                })
+                .unwrap_or(CHAR_ADVANCE)
+                .max(CHAR_ADVANCE);
+            let y = PAGE_TOP_PAD + row as f32 * LINE_H + sub_y + LINE_H - 2.0;
+            layer = layer.child(
+                el().key(format!("diag-{}", diag.line))
+                    .absolute(x, y)
+                    .size(width, 1.0)
+                    .fill(rgb_color(ink))
+                    .transition(Transition::none()),
+            );
+        }
+        page = page.child(layer);
+    }
+    page
 }
 
 /// Expand `\t` to spaces aligned to 4-column stops so drawing and column math

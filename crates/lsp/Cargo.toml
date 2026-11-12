@@ -1,0 +1,14 @@
+[package]
+name = "pen-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pen's language-server client. Speaks JSON-RPC over stdio. Ships no server."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

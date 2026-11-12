@@ -38,6 +38,7 @@ continuity without re-deriving tokens or proportions.
 - **Instant (`Transition::none()` + `tx.instant()`):** Caret movement, typing, scrolling, tab/file switching, command palette open/close, find bar open/close, focus rings.
 - **Sidebar pane:** Critically damped spring (`Spring::new(0.35, 0.0)` — `0.35 s`, bounce `0`). Under `prefers-reduced-motion` (`cx.is_reduced_motion()`), `SplitView::reduced_motion(true)` replaces translation with an opacity fade.
 - **First launch only:** `200 ms` page opacity fade (`Spring::new(0.20, 0.0)`) gated by `<config>/pen/launched`; every subsequent launch is `0 ms` instant.
+- **Diagnostic arrival:** opacity fade, `Spring::new(0.20, 0.0)` in and `0.15s` out, bounce `0`. Underline position does not move. Reduced motion is instant. The status line still prints the message.
 - **Press scale:** Skipped in Phase 1 because the pinned Rune rev exposes no fine-pointer query on `Cx`/`Env` (per Task 10 spec).
 
 ## Key Component Measurements

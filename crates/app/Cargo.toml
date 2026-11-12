@@ -16,9 +16,11 @@ path = "src/main.rs"
 [dependencies]
 buffer = { path = "../buffer" }
 highlight = { path = "../highlight" }
+pen-lsp = { path = "../lsp" }
 pen-git = { path = "../git" }
 project = { path = "../project" }
 rune.workspace = true
+serde_json.workspace = true
 rune-kit.workspace = true
 tokio.workspace = true
 

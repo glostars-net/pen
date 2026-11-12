@@ -66,6 +66,7 @@ pen/
 │   ├── buffer/                 # Rope text model, inverse-edit undo (cap 256), viewport, find, IME boundary
 │   ├── project/                # Gitignore-aware walk, path-confined UTF-8 read, atomic write, 50ms watcher
 │   ├── highlight/              # Ink & Paper JSONs, WCAG contrast math, OKLab 5-step syntax ramp
+│   ├── lsp/                    # JSON-RPC client (`pen-lsp`). Ships no server.
 │   └── app/                    # Binary `pen` + lib `pen`: Rune shell, editor surface, palette, find bar
 └── plan/                       # Phase 1–5 specs (Phase 1 shipped; Phases 2–5 queued)
 ```

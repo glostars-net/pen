@@ -151,3 +151,21 @@ Gate verified on `rustc 1.99.1` against pinned Rune rev
 - **Design check (inspected 2× Retina Ink and Paper frames across `diff-paper`, `diff-ink`, `git-paper`, and `git-ink` scenes):**
   - **Monochrome ink-step diff:** confirmed (`theme.added` and `theme.removed` derive from contrast-checked `>= 4.5:1` OKLab ink steps mapped onto `rune_kit::DiffView`, paired with a five-step monochrome `diff_highlighter`; zero green/red diff bars or rainbow syntax).
   - **Tree & Changes status labels:** confirmed (`+n −n` using true minus `U+2212` for tracked modifications and `new` for untracked files in `theme.faint` tabular numerals; no colored status dot).
+
+## Phase 3b
+
+The empty window is a home screen: `Open a folder`, `New project`, and up to eight recent folders that still exist. A `File` menu sits at the leading edge of the toolbar. Settings is a page for appearance and a display name. The file tree uses the ink marks in `assets/icons/files/`. A new project is created from a local catalog; a row is hidden when its tool is not installed. The terminal dock slot exists and is not shown.
+
+With no recent folders, the home screen shows the two actions and no Recent heading.
+
+## Phase 3
+
+Language servers are optional. Pen ships none. A missing `lsp.json` (next to `theme.json` in the app config dir) starts no process, and the caret still moves. Confirmed by the host treating a missing file as an empty server list, and by `editor_frame` still drawing the caret. This session did not type in a live window.
+
+- **Crate:** `crates/lsp`, package `pen-lsp`. JSON-RPC over stdio, `Content-Length` frames, 8 MB cap. The UI thread never awaits a server.
+- **Config:** `[{"language":"rust","command":"rust-analyzer","args":[]}]`. A `..` segment in `command` is refused. Relative commands stay relative and resolve on `PATH` at spawn.
+- **Diagnostics:** faint ink underlines on visible lines of the open file. A `diagnostic` color under 4.5:1 against the ground is dropped. The line under the caret also prints the message in the status strip, so the underline is not the only cue.
+- **Motion:** a diagnostic set fades in on Rune's opacity spring (`0.20s` in, `0.15s` out, bounce `0`). Typing, the caret, the palette, Find, and go to definition stay instant. Reduced motion uses `Transition::none()`.
+- **Go to definition:** palette command. A location outside the project root is ignored. No match sets the status line to "No definition."
+- **Crash:** status line "Language server stopped." Restart at most once a minute. A missing binary is reported once and not retried.
+- **Gate:** `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets` passed on this branch.
