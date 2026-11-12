@@ -528,7 +528,10 @@ pub fn editor_view_themed(
     let selection = state.selection();
     let num_w = state.line_number_width();
 
-    let ink = diagnostics::underline_color(theme, None);
+    let override_hex = theme
+        .diagnostic
+        .map(|c| format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2));
+    let ink = diagnostics::underline_color(theme, override_hex.as_deref());
     let mut rows = col()
         .key("pen/rows")
         .w_full()
