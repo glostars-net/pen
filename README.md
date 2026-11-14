@@ -152,6 +152,10 @@ Gate verified on `rustc 1.99.1` against pinned Rune rev
   - **Monochrome ink-step diff:** confirmed (`theme.added` and `theme.removed` derive from contrast-checked `>= 4.5:1` OKLab ink steps mapped onto `rune_kit::DiffView`, paired with a five-step monochrome `diff_highlighter`; zero green/red diff bars or rainbow syntax).
   - **Tree & Changes status labels:** confirmed (`+n −n` using true minus `U+2212` for tracked modifications and `new` for untracked files in `theme.faint` tabular numerals; no colored status dot).
 
+## Phase 4
+
+Plugins are optional WASM components in `plugins/` next to `theme.json`. Pen does not download them. A plugin may register a command and a theme JSON string. It cannot read the disk, open a socket, or draw UI. A command that matches a built-in name is rejected. Theme JSON goes through `load_theme`; a bad file is skipped and does not replace Ink or Paper. A trap stops that plugin and the editor keeps running. With no plugins directory, the palette gained no rows. Confirmed by `missing_plugins_dir_adds_nothing`. This session did not open a window.
+
 ## Phase 3b
 
 The empty window is a home screen: `Open a folder`, `New project`, and up to sixteen recent folders that still exist, with Pin and Remove. On macOS, File is in the menu bar with Edit and Window. On Windows and Linux, File is a menu in the window. Settings is a page for appearance and a display name. The file tree uses the ink marks in `assets/icons/files/`. A new project is created from a local catalog; a row is hidden when its tool is not installed. The terminal dock slot exists and is not shown.
