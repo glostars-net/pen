@@ -65,8 +65,13 @@ cargo run --release -p pen -- /path/to/folder
 | Open folder | `⌘O` | `Ctrl+O` |
 | Save (atomic temp + rename) | `⌘S` | `Ctrl+S` |
 | Find in file | `⌘F` (`Enter` next, `Esc` close) | `Ctrl+F` (`Enter` next, `Esc` close) |
-| Toggle sidebar | `⇧⌘B` | `Ctrl+Shift+B` |
+| Toggle sidebar | `⌘B` or `⇧⌘B` | `Ctrl+B` or `Ctrl+Shift+B` |
 | Undo / Redo | `⌘Z` / `⇧⌘Z` | `Ctrl+Z` / `Ctrl+Shift+Z` (`Ctrl+Y`) |
+| Zoom in / out / reset | `⌘=` / `⌘-` / `⌘0` | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| Toggle comment | `⌘/` | `Ctrl+/` |
+| Delete line | `⇧⌘K` | `Ctrl+Shift+K` |
+| Move line | `⌥↑` / `⌥↓` | `Alt+Up` / `Alt+Down` |
+| Indent / outdent | `⌘]` / `⌘[` | `Ctrl+]` / `Ctrl+[` |
 
 ### Themes & custom `theme.json`
 
@@ -151,6 +156,10 @@ Gate verified on `rustc 1.99.1` against pinned Rune rev
 - **Design check (inspected 2× Retina Ink and Paper frames across `diff-paper`, `diff-ink`, `git-paper`, and `git-ink` scenes):**
   - **Monochrome ink-step diff:** confirmed (`theme.added` and `theme.removed` derive from contrast-checked `>= 4.5:1` OKLab ink steps mapped onto `rune_kit::DiffView`, paired with a five-step monochrome `diff_highlighter`; zero green/red diff bars or rainbow syntax).
   - **Tree & Changes status labels:** confirmed (`+n −n` using true minus `U+2212` for tracked modifications and `new` for untracked files in `theme.faint` tabular numerals; no colored status dot).
+
+## Phase 6
+
+The writing page zooms from 9 pt to 28 pt (`⌘=` / `⌘-` / `⌘0`). Chrome stays at 13 pt. Syntax stays the five-step ink ramp; a `theme.json` `syntax` list is still the only way to add hue, and a step under 4.5:1 is still dropped. The extra chords match Visual Studio Code: comment, delete line, move line, indent, and `⌘⇧P` for the palette. Zoom is not saved.
 
 ## Phase 5
 

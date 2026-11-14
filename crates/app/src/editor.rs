@@ -18,11 +18,22 @@ use crate::theme_kit::rgb_color;
 
 /// Code size in points (Design: 13px, line-height 1.55, tracking 0).
 pub const CODE_SIZE: f32 = 13.0;
-/// Exact row pitch: `13.0 * 1.55 = 20.15` pt.
+/// Exact row pitch at the default size: `13.0 * 1.55 = 20.15` pt.
 pub const LINE_H: f32 = 20.15;
 /// IBM Plex Mono Regular has `unitsPerEm = 1000` and glyph advance `600`:
-/// `13.0 * 600 / 1000 = 7.80` pt exact.
+/// `13.0 * 600 / 1000 = 7.80` pt exact at the default size.
 pub const CHAR_ADVANCE: f32 = 7.80;
+/// Writing-page zoom stops. Chrome stays at [`CODE_SIZE`].
+pub const ZOOM_MIN: f32 = 9.0;
+pub const ZOOM_MAX: f32 = 28.0;
+
+pub fn line_h_for(size: f32) -> f32 {
+    size * (LINE_H / CODE_SIZE)
+}
+
+pub fn advance_for(size: f32) -> f32 {
+    size * (CHAR_ADVANCE / CODE_SIZE)
+}
 /// Signature notebook left margin before the line numbers (Design: 48 pt).
 pub const NOTEBOOK_MARGIN: f32 = 48.0;
 /// Breathing room between the right-aligned line number and the code column.
@@ -36,29 +47,33 @@ pub const CARET_WIDTH: f32 = 1.5;
 /// Tab stop width in columns.
 const TAB_STOP: usize = 4;
 
-const CODE_FONT: TextStyle = TextStyle {
-    size: CODE_SIZE,
-    weight: 400.0,
-    family: Family::Mono,
-    line_height: LINE_H,
-    tracking: 0.0,
-    variations: "",
-    features: "",
-    optical_size: OpticalSize::Auto,
-    italic: false,
-};
+fn code_font(size: f32) -> TextStyle {
+    TextStyle {
+        size,
+        weight: 400.0,
+        family: Family::Mono,
+        line_height: line_h_for(size),
+        tracking: 0.0,
+        variations: "",
+        features: "",
+        optical_size: OpticalSize::Auto,
+        italic: false,
+    }
+}
 
-const LINE_NO_FONT: TextStyle = TextStyle {
-    size: CODE_SIZE,
-    weight: 400.0,
-    family: Family::Mono,
-    line_height: LINE_H,
-    tracking: 0.0,
-    variations: "",
-    features: "'tnum' 1",
-    optical_size: OpticalSize::Auto,
-    italic: false,
-};
+fn line_no_font(size: f32) -> TextStyle {
+    TextStyle {
+        size,
+        weight: 400.0,
+        family: Family::Mono,
+        line_height: line_h_for(size),
+        tracking: 0.0,
+        variations: "",
+        features: "'tnum' 1",
+        optical_size: OpticalSize::Auto,
+        italic: false,
+    }
+}
 
 /// An open editor page: one `Buffer`, one caret, an optional selection anchor,
 /// and an optional IME composition.
@@ -79,6 +94,8 @@ pub struct EditorState {
     pub theme: Theme,
     /// Language alias from `highlight::lang_for_path` (e.g. `"rust"`).
     pub language: Option<String>,
+    /// Writing-page size in points. Chrome does not follow this.
+    pub code_size: f32,
 }
 
 impl EditorState {
@@ -98,6 +115,26 @@ impl EditorState {
             focused: true,
             theme: highlight::paper(),
             language: None,
+            code_size: CODE_SIZE,
+        }
+    }
+
+    pub fn line_h(&self) -> f32 {
+        line_h_for(self.code_size)
+    }
+
+    pub fn char_advance(&self) -> f32 {
+        advance_for(self.code_size)
+    }
+
+    /// Clamp to 9–28 pt and keep the same line at the top of the page.
+    pub fn set_code_size(&mut self, size: f32) {
+        let next = size.round().clamp(ZOOM_MIN, ZOOM_MAX);
+        let old = self.line_h();
+        self.code_size = next;
+        let new = self.line_h();
+        if old > 0.0 {
+            self.scroll_y *= f64::from(new / old);
         }
     }
 
@@ -130,7 +167,7 @@ impl EditorState {
     pub fn line_number_width(&self) -> f32 {
         let digits = self.buffer.len_lines().max(1).ilog10() as usize + 1;
         let cols = digits.max(3) as f32;
-        (cols * CHAR_ADVANCE).ceil()
+        (cols * self.char_advance()).ceil()
     }
 
     /// X offset from the page's left edge to column 0 of code.
@@ -141,15 +178,16 @@ impl EditorState {
     /// Scroll vertically by `dy` points (wheel delta: negative scrolls down in
     /// Rune's `WheelEvent`, matching AppKit/winit).
     pub fn scroll_by(&mut self, dy: f32) {
-        let max_y = ((self.buffer.len_lines().saturating_sub(1)) as f64) * f64::from(LINE_H);
+        let max_y = ((self.buffer.len_lines().saturating_sub(1)) as f64) * f64::from(self.line_h());
         self.scroll_y = (self.scroll_y - f64::from(dy)).clamp(0.0, max_y);
     }
 
     /// Keep the caret's line inside the visible window after an edit or move.
     pub fn reveal_caret(&mut self) {
         let line = self.buffer.char_to_line(self.visual_caret());
-        let top = (line as f64) * f64::from(LINE_H);
-        let view = f64::from((self.viewport_height - PAGE_TOP_PAD - LINE_H).max(LINE_H));
+        let top = (line as f64) * f64::from(self.line_h());
+        let view =
+            f64::from((self.viewport_height - PAGE_TOP_PAD - self.line_h()).max(self.line_h()));
         if top < self.scroll_y {
             self.scroll_y = top;
         } else if top > self.scroll_y + view {
@@ -350,13 +388,13 @@ impl EditorState {
                 true
             }
             Key::PageUp => {
-                let step = ((self.viewport_height / LINE_H).floor() as usize).max(1);
+                let step = ((self.viewport_height / self.line_h()).floor() as usize).max(1);
                 let line = self.buffer.char_to_line(self.caret).saturating_sub(step);
                 self.move_to(self.buffer.line_to_char(line), shift);
                 true
             }
             Key::PageDown => {
-                let step = ((self.viewport_height / LINE_H).floor() as usize).max(1);
+                let step = ((self.viewport_height / self.line_h()).floor() as usize).max(1);
                 let line = (self.buffer.char_to_line(self.caret) + step)
                     .min(self.buffer.len_lines().saturating_sub(1));
                 self.move_to(self.buffer.line_to_char(line), shift);
@@ -463,13 +501,16 @@ impl EditorState {
     }
 
     fn char_at_point(&self, x: f32, y: f32) -> usize {
-        let first_line = (self.scroll_y / f64::from(LINE_H)).floor() as usize;
-        let sub_y = -((self.scroll_y % f64::from(LINE_H)) as f32);
+        let line_h = self.line_h();
+        let first_line = (self.scroll_y / f64::from(line_h)).floor() as usize;
+        let sub_y = -((self.scroll_y % f64::from(line_h)) as f32);
         let rel_y = (y - PAGE_TOP_PAD - sub_y).max(0.0);
-        let line = (first_line + (rel_y / LINE_H).floor() as usize)
+        let line = (first_line + (rel_y / line_h).floor() as usize)
             .min(self.buffer.len_lines().saturating_sub(1));
         let line_str = self.buffer.line(line);
-        let vis_col = ((x - self.code_left()) / CHAR_ADVANCE).round().max(0.0) as usize;
+        let vis_col = ((x - self.code_left()) / self.char_advance())
+            .round()
+            .max(0.0) as usize;
         let char_col = char_col_at_visual(&line_str, vis_col);
         self.buffer.line_to_char(line) + char_col
     }
@@ -494,6 +535,230 @@ impl EditorState {
         }
         (line_start + s, line_start + e)
     }
+
+    /// Apply a writing-page chord. Returns true when the buffer changed.
+    pub fn apply_chord(&mut self, chord: crate::keys::Chord) -> bool {
+        use crate::keys::Chord;
+        match chord {
+            Chord::ZoomIn => {
+                self.set_code_size(self.code_size + 1.0);
+                false
+            }
+            Chord::ZoomOut => {
+                self.set_code_size(self.code_size - 1.0);
+                false
+            }
+            Chord::ZoomReset => {
+                self.set_code_size(CODE_SIZE);
+                false
+            }
+            Chord::ToggleComment => {
+                self.toggle_comment();
+                true
+            }
+            Chord::DeleteLine => {
+                self.delete_lines();
+                true
+            }
+            Chord::MoveLineUp => self.move_lines(false),
+            Chord::MoveLineDown => self.move_lines(true),
+            Chord::Indent => {
+                self.shift_indent(false);
+                true
+            }
+            Chord::Outdent => {
+                self.shift_indent(true);
+                true
+            }
+            Chord::SelectLine => {
+                self.select_lines();
+                false
+            }
+            Chord::InsertLineBelow => {
+                self.insert_blank(false);
+                true
+            }
+            Chord::InsertLineAbove => {
+                self.insert_blank(true);
+                true
+            }
+            Chord::Palette | Chord::Sidebar => false,
+        }
+    }
+
+    fn affected_lines(&self) -> (usize, usize) {
+        let start_idx = self.anchor.min(self.caret);
+        let end_idx = self.anchor.max(self.caret);
+        let start = self.buffer.char_to_line(start_idx);
+        let mut end = self.buffer.char_to_line(end_idx);
+        if end_idx > start_idx && end_idx == self.buffer.line_to_char(end) && end > start {
+            end -= 1;
+        }
+        (start, end)
+    }
+
+    fn set_line(&mut self, line: usize, text: &str) {
+        let start = self.buffer.line_to_char(line);
+        let end = start + self.buffer.line_len_chars(line);
+        if start < end {
+            self.buffer.delete(start..end);
+        }
+        if !text.is_empty() {
+            self.buffer.insert(start, text);
+        }
+    }
+
+    fn span_text(&self, start_line: usize, end_line: usize) -> String {
+        let mut text = (start_line..=end_line)
+            .map(|i| self.buffer.line(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if end_line + 1 < self.buffer.len_lines() {
+            text.push('\n');
+        }
+        text
+    }
+
+    fn line_end(&self, line: usize) -> usize {
+        if line + 1 < self.buffer.len_lines() {
+            self.buffer.line_to_char(line + 1)
+        } else {
+            self.buffer.len_chars()
+        }
+    }
+
+    fn toggle_comment(&mut self) {
+        let mark = crate::keys::comment_mark(self.language.as_deref());
+        let (a, b) = self.affected_lines();
+        let lines: Vec<String> = (a..=b).map(|i| self.buffer.line(i)).collect();
+        let uncomment = lines
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .all(|l| is_commented(l, mark.start, mark.end));
+        for (offset, line) in lines.iter().enumerate().rev() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let next = if uncomment {
+                uncomment_line(line, mark.start, mark.end)
+            } else {
+                comment_line(line, mark.start, mark.end)
+            };
+            self.set_line(a + offset, &next);
+        }
+    }
+
+    fn delete_lines(&mut self) {
+        let (a, b) = self.affected_lines();
+        let last = self.buffer.len_lines().saturating_sub(1);
+        let (start, end) = if b >= last && a > 0 {
+            (
+                self.buffer.line_to_char(a).saturating_sub(1),
+                self.buffer.len_chars(),
+            )
+        } else {
+            (self.buffer.line_to_char(a), self.line_end(b))
+        };
+        if start < end {
+            self.buffer.delete(start..end);
+        }
+        let caret = start.min(self.buffer.len_chars());
+        self.caret = caret;
+        self.anchor = caret;
+    }
+
+    fn move_lines(&mut self, down: bool) -> bool {
+        let (a, b) = self.affected_lines();
+        let last = self.buffer.len_lines().saturating_sub(1);
+        if down && b >= last || !down && a == 0 {
+            return false;
+        }
+        let (start, end, text, new_line) = if down {
+            let mut block = self.span_text(a, b);
+            let mut neighbor = self.span_text(b + 1, b + 1);
+            if b + 1 == last && block.ends_with('\n') {
+                block.pop();
+                if !neighbor.ends_with('\n') {
+                    neighbor.push('\n');
+                }
+            }
+            (
+                self.buffer.line_to_char(a),
+                self.line_end(b + 1),
+                format!("{neighbor}{block}"),
+                a + 1,
+            )
+        } else {
+            let neighbor = self.span_text(a - 1, a - 1);
+            let mut block = self.span_text(a, b);
+            if b == last && neighbor.ends_with('\n') && !block.ends_with('\n') {
+                block.push('\n');
+                let neighbor = neighbor.trim_end_matches('\n');
+                (
+                    self.buffer.line_to_char(a - 1),
+                    self.line_end(b),
+                    format!("{block}{neighbor}"),
+                    a - 1,
+                )
+            } else {
+                (
+                    self.buffer.line_to_char(a - 1),
+                    self.line_end(b),
+                    format!("{block}{neighbor}"),
+                    a - 1,
+                )
+            }
+        };
+        let col = self.caret
+            - self
+                .buffer
+                .line_to_char(self.buffer.char_to_line(self.caret));
+        self.buffer.delete(start..end);
+        self.buffer.insert(start, &text);
+        let line_start = self
+            .buffer
+            .line_to_char(new_line.min(self.buffer.len_lines().saturating_sub(1)));
+        let len = self
+            .buffer
+            .line_len_chars(self.buffer.char_to_line(line_start));
+        self.caret = line_start + col.min(len);
+        self.anchor = self.caret;
+        true
+    }
+
+    fn shift_indent(&mut self, out: bool) {
+        let (a, b) = self.affected_lines();
+        for line in (a..=b).rev() {
+            let text = self.buffer.line(line);
+            let next = if out {
+                outdent_text(&text)
+            } else {
+                format!("    {text}")
+            };
+            if next != text {
+                self.set_line(line, &next);
+            }
+        }
+    }
+
+    fn select_lines(&mut self) {
+        let (a, b) = self.affected_lines();
+        self.anchor = self.buffer.line_to_char(a);
+        self.caret = self.line_end(b);
+    }
+
+    fn insert_blank(&mut self, above: bool) {
+        let line = self.buffer.char_to_line(self.caret);
+        let at = if above {
+            self.buffer.line_to_char(line)
+        } else {
+            self.buffer.line_to_char(line) + self.buffer.line_len_chars(line)
+        };
+        self.buffer.insert(at, "\n");
+        self.caret = if above { at } else { at + 1 };
+        self.anchor = self.caret;
+        self.reveal_caret();
+    }
 }
 
 /// Draw the editor page from `state`. Pure function of `&EditorState`: reads
@@ -512,10 +777,14 @@ pub fn editor_view_themed(
     let fg = rgb_color(theme.fg);
     let faint = rgb_color(theme.faint);
     let sel_color = fg.alpha(0.12);
+    let line_h = state.line_h();
+    let advance = state.char_advance();
+    let code_font = code_font(state.code_size);
+    let line_no_font = line_no_font(state.code_size);
 
-    let first_line = (state.scroll_y / f64::from(LINE_H)).floor() as usize;
-    let sub_y = -((state.scroll_y % f64::from(LINE_H)) as f32);
-    let visible_lines = ((state.viewport_height / LINE_H).ceil() as usize).max(1);
+    let first_line = (state.scroll_y / f64::from(line_h)).floor() as usize;
+    let sub_y = -((state.scroll_y % f64::from(line_h)) as f32);
+    let visible_lines = ((state.viewport_height / line_h).ceil() as usize).max(1);
     let window = state
         .buffer
         .viewport(first_line, visible_lines + OVERSCAN_LINES);
@@ -546,7 +815,7 @@ pub fn editor_view_themed(
         let line_end = line_start + line_chars;
         let expanded = &expanded_lines[row_pos];
 
-        let mut code_cell = el().grow(1.0).h(LINE_H);
+        let mut code_cell = el().grow(1.0).h(line_h);
 
         // Selection band behind text (foreground at 12%, radius 0).
         if let Some(sel) = &selection
@@ -555,18 +824,14 @@ pub fn editor_view_themed(
         {
             let c0 = sel.start.saturating_sub(line_start).min(line_chars);
             let c1 = sel.end.saturating_sub(line_start).min(line_chars);
-            let x0 = visual_col(&slice.text, c0) as f32 * CHAR_ADVANCE;
-            let extra = if sel.end > line_end {
-                CHAR_ADVANCE
-            } else {
-                0.0
-            };
-            let x1 = visual_col(&slice.text, c1) as f32 * CHAR_ADVANCE + extra;
+            let x0 = visual_col(&slice.text, c0) as f32 * advance;
+            let extra = if sel.end > line_end { advance } else { 0.0 };
+            let x1 = visual_col(&slice.text, c1) as f32 * advance + extra;
             if x1 > x0 {
                 code_cell = code_cell.child(
                     el().key(format!("sel-{i}"))
                         .absolute(x0, 0.0)
-                        .size(x1 - x0, LINE_H)
+                        .size(x1 - x0, line_h)
                         .fill(sel_color)
                         .transition(Transition::none()),
                 );
@@ -576,7 +841,7 @@ pub fn editor_view_themed(
         // Code line: five-step OKLab syntax ramp over the viewport only (`text` keeps `wrap = false`).
         let line_spans = &syntax_per_line[row_pos];
         let mut text_el = text(expanded.clone())
-            .font(CODE_FONT)
+            .font(code_font)
             .color(fg)
             .transition(Transition::none());
         if !line_spans.is_empty() {
@@ -596,12 +861,12 @@ pub fn editor_view_themed(
             if pre.start <= line_end && pre_end >= line_start {
                 let c0 = pre.start.saturating_sub(line_start).min(line_chars);
                 let c1 = pre_end.saturating_sub(line_start).min(line_chars);
-                let x0 = visual_col(&slice.text, c0) as f32 * CHAR_ADVANCE;
-                let x1 = visual_col(&slice.text, c1) as f32 * CHAR_ADVANCE;
+                let x0 = visual_col(&slice.text, c0) as f32 * advance;
+                let x1 = visual_col(&slice.text, c1) as f32 * advance;
                 if x1 > x0 {
                     code_cell = code_cell.child(
                         el().key(format!("ime-{i}"))
-                            .absolute(x0, LINE_H - 2.0)
+                            .absolute(x0, line_h - 2.0)
                             .size(x1 - x0, 1.0)
                             .fill(fg)
                             .transition(Transition::none()),
@@ -613,11 +878,11 @@ pub fn editor_view_themed(
         // The caret: 1.5 px ink stroke, instant, `.ime_cursor()` when focused.
         if i == caret_line {
             let col_chars = caret_pos.saturating_sub(line_start).min(line_chars);
-            let cx = visual_col(&slice.text, col_chars) as f32 * CHAR_ADVANCE;
+            let cx = visual_col(&slice.text, col_chars) as f32 * advance;
             let mut caret = el()
                 .key("pen/caret")
                 .absolute(cx, 2.0)
-                .size(CARET_WIDTH, LINE_H - 4.0)
+                .size(CARET_WIDTH, line_h - 4.0)
                 .fill(fg)
                 .transition(Transition::none());
             if state.focused {
@@ -626,11 +891,11 @@ pub fn editor_view_themed(
             code_cell = code_cell.child(caret);
         }
 
-        let number = el().w(num_w).h(LINE_H).child(
+        let number = el().w(num_w).h(line_h).child(
             text(format!("{}", i + 1))
                 .w(num_w)
                 .align(Align::End)
-                .font(LINE_NO_FONT)
+                .font(line_no_font)
                 .color(faint)
                 .transition(Transition::none()),
         );
@@ -638,13 +903,13 @@ pub fn editor_view_themed(
         let line_row = row()
             .key(format!("ln-{i}"))
             .w_full()
-            .h(LINE_H)
+            .h(line_h)
             .pl(NOTEBOOK_MARGIN)
             .pr(24.0)
             .center_y()
             .transition(Transition::none())
             .child(number)
-            .child(el().w(GUTTER_GAP).h(LINE_H))
+            .child(el().w(GUTTER_GAP).h(line_h))
             .child(code_cell);
 
         rows = rows.child(line_row);
@@ -657,7 +922,7 @@ pub fn editor_view_themed(
     if total > visible_lines {
         let track = (state.viewport_height - 16.0).max(24.0);
         let thumb_h = ((visible_lines as f32 / total as f32) * track).clamp(24.0, track);
-        let max_scroll = ((total - 1) as f64 * f64::from(LINE_H)).max(1.0);
+        let max_scroll = ((total - 1) as f64 * f64::from(line_h)).max(1.0);
         let frac = (state.scroll_y / max_scroll).clamp(0.0, 1.0) as f32;
         let thumb_y = 8.0 + frac * (track - thumb_h);
         let rail = el().w(6.0).h_full().child(
@@ -696,12 +961,10 @@ pub fn editor_view_themed(
             let row = diag.line - first_line;
             let width = window
                 .get(row)
-                .map(|slice| {
-                    visual_col(&slice.text, slice.text.chars().count()) as f32 * CHAR_ADVANCE
-                })
-                .unwrap_or(CHAR_ADVANCE)
-                .max(CHAR_ADVANCE);
-            let y = PAGE_TOP_PAD + row as f32 * LINE_H + sub_y + LINE_H - 2.0;
+                .map(|slice| visual_col(&slice.text, slice.text.chars().count()) as f32 * advance)
+                .unwrap_or(advance)
+                .max(advance);
+            let y = PAGE_TOP_PAD + row as f32 * line_h + sub_y + line_h - 2.0;
             layer = layer.child(
                 el().key(format!("diag-{}", diag.line))
                     .absolute(x, y)
@@ -713,6 +976,46 @@ pub fn editor_view_themed(
         page = page.child(layer);
     }
     page
+}
+
+fn is_commented(line: &str, start: &str, end: &str) -> bool {
+    let trimmed = line.trim();
+    let token = start.trim_end();
+    let tail = end.trim();
+    trimmed.starts_with(token) && (tail.is_empty() || trimmed.ends_with(tail))
+}
+
+fn comment_line(line: &str, start: &str, end: &str) -> String {
+    let indent = line.len() - line.trim_start().len();
+    let (lead, rest) = line.split_at(indent);
+    format!("{lead}{start}{rest}{end}")
+}
+
+fn uncomment_line(line: &str, start: &str, end: &str) -> String {
+    let indent = line.len() - line.trim_start().len();
+    let (lead, rest) = line.split_at(indent);
+    let token = start.trim_end();
+    let Some(body) = rest.trim_start().strip_prefix(token) else {
+        return line.to_owned();
+    };
+    let body = body.strip_prefix(' ').unwrap_or(body);
+    let body = if end.is_empty() {
+        body
+    } else {
+        body.trim_end()
+            .strip_suffix(end.trim())
+            .unwrap_or(body)
+            .trim_end()
+    };
+    format!("{lead}{body}")
+}
+
+fn outdent_text(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix('\t') {
+        return rest.to_owned();
+    }
+    let spaces = text.chars().take_while(|c| *c == ' ').count().min(4);
+    text.chars().skip(spaces).collect()
 }
 
 /// Expand `\t` to spaces aligned to 4-column stops so drawing and column math
@@ -766,4 +1069,54 @@ fn char_col_at_visual(line: &str, target_vis: usize) -> usize {
         vis += w;
     }
     line.chars().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::Chord;
+
+    #[test]
+    fn zoom_stops_at_the_ends_and_keeps_the_line() {
+        let mut ed = EditorState::from_str("a\nb\nc");
+        ed.scroll_y = 20.15;
+        ed.apply_chord(Chord::ZoomIn);
+        assert_eq!(ed.code_size, 14.0);
+        assert!((ed.scroll_y - 20.15 * 14.0 / 13.0).abs() < 0.01);
+        ed.set_code_size(28.0);
+        ed.apply_chord(Chord::ZoomIn);
+        assert_eq!(ed.code_size, 28.0);
+        ed.set_code_size(9.0);
+        ed.apply_chord(Chord::ZoomOut);
+        assert_eq!(ed.code_size, 9.0);
+        ed.apply_chord(Chord::ZoomReset);
+        assert_eq!(ed.code_size, 13.0);
+    }
+
+    #[test]
+    fn comment_toggles_and_delete_keeps_the_other_lines() {
+        let mut ed = EditorState::from_str("fn a() {}\nkeep").with_language(Some("rust"));
+        ed.apply_chord(Chord::ToggleComment);
+        assert_eq!(ed.buffer.line(0), "// fn a() {}");
+        ed.apply_chord(Chord::ToggleComment);
+        assert_eq!(ed.buffer.line(0), "fn a() {}");
+        ed.apply_chord(Chord::DeleteLine);
+        assert_eq!(ed.buffer.line(0), "keep");
+    }
+
+    #[test]
+    fn move_line_swaps_with_the_neighbor() {
+        let mut ed = EditorState::from_str("a\nb\nc");
+        ed.caret = 2;
+        ed.anchor = 2;
+        assert!(ed.apply_chord(Chord::MoveLineDown));
+        assert_eq!(ed.buffer.line(0), "a");
+        assert_eq!(ed.buffer.line(1), "c");
+        assert_eq!(ed.buffer.line(2), "b");
+        ed.caret = ed.buffer.len_chars();
+        ed.anchor = ed.caret;
+        assert!(ed.apply_chord(Chord::MoveLineUp));
+        assert_eq!(ed.buffer.line(1), "b");
+        assert_eq!(ed.buffer.line(2), "c");
+    }
 }

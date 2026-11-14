@@ -25,6 +25,7 @@ use pen::git_panel::{
     coalesce_latest_root, commit_bar, confirm_bar, diff_page_view, git_dock_container,
     git_remote_bar, history_section, status_label, worktrees_section,
 };
+use pen::keys::{self, Chord};
 use pen::lsp_host::{self, LspCmd, LspEvent};
 use pen::palette::{BUILTIN_COMMANDS, filter_command_list, shortcut_hint};
 use pen::recents::{self, Recent, from_json, to_json};
@@ -1274,7 +1275,7 @@ fn place_jump(ed: &mut EditorState, line: usize) {
     let line = line.min(ed.buffer.len_lines().saturating_sub(1));
     ed.caret = ed.buffer.line_to_char(line);
     ed.anchor = ed.caret;
-    let target = line as f64 * f64::from(LINE_H);
+    let target = line as f64 * f64::from(ed.line_h());
     ed.scroll_y = (target - 80.0).max(0.0);
 }
 
@@ -1891,6 +1892,17 @@ impl Pen {
         tx.instant();
     }
 
+    fn apply_page_chord(&mut self, chord: Chord, tx: &mut Tx) {
+        let OpenPage::Editor(ed) = &mut self.page else {
+            return;
+        };
+        let dirty = ed.apply_chord(chord);
+        if dirty {
+            self.note_edit();
+        }
+        tx.instant();
+    }
+
     fn run_command(&mut self, name: &str, tx: &mut Tx) {
         self.close_palette(tx);
         match name {
@@ -1901,6 +1913,9 @@ impl Pen {
             "Find" => self.open_find(tx),
             "Go to definition" => self.go_to_definition(tx),
             "OpenCode" => self.toggle_agent(tx),
+            "Zoom in" => self.apply_page_chord(Chord::ZoomIn, tx),
+            "Zoom out" => self.apply_page_chord(Chord::ZoomOut, tx),
+            "Reset zoom" => self.apply_page_chord(Chord::ZoomReset, tx),
             "Stage file" => {
                 let target = self
                     .active_path
@@ -3406,9 +3421,28 @@ fn editor_page_container(
 }
 
 fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    if ev.is_command('k') {
+    if ev.is_command('k') && !ev.mods.shift {
         s.toggle_palette(tx);
         return true;
+    }
+    if let Some(chord) = keys::chord(ev) {
+        match chord {
+            Chord::Palette => {
+                s.toggle_palette(tx);
+                return true;
+            }
+            Chord::Sidebar if s.project.is_some() => {
+                s.sidebar.toggle();
+                tx.instant();
+                return true;
+            }
+            Chord::Sidebar => {}
+            other if !s.palette_open && !s.find_open && !s.git_panel.has_active_input() => {
+                s.apply_page_chord(other, tx);
+                return true;
+            }
+            _ => {}
+        }
     }
     if s.palette_open {
         if ev.key == Key::Escape {

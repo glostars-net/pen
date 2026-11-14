@@ -11,6 +11,7 @@ pub mod file_mark;
 pub mod git_guard;
 pub mod git_panel;
 pub mod goto;
+pub mod keys;
 pub mod lsp_host;
 pub mod palette;
 pub mod recents;

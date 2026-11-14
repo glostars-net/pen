@@ -32,6 +32,9 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "Use Paper",
     "Go to definition",
     "OpenCode",
+    "Zoom in",
+    "Zoom out",
+    "Reset zoom",
 ];
 
 #[derive(Debug, Error, PartialEq, Eq)]

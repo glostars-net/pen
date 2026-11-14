@@ -18,6 +18,9 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "Use Paper",
     "Go to definition",
     "OpenCode",
+    "Zoom in",
+    "Zoom out",
+    "Reset zoom",
 ];
 
 /// Case-insensitive substring filter over `commands`, preserving order.
@@ -52,6 +55,21 @@ pub fn shortcut_hint(command: &str) -> Option<&'static str> {
             "⌘F"
         } else {
             "Ctrl+F"
+        }),
+        "Zoom in" => Some(if cfg!(target_os = "macos") {
+            "⌘="
+        } else {
+            "Ctrl+="
+        }),
+        "Zoom out" => Some(if cfg!(target_os = "macos") {
+            "⌘-"
+        } else {
+            "Ctrl+-"
+        }),
+        "Reset zoom" => Some(if cfg!(target_os = "macos") {
+            "⌘0"
+        } else {
+            "Ctrl+0"
         }),
         _ => None,
     }
