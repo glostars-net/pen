@@ -121,6 +121,7 @@ enum IoCmd {
         bytes: Vec<u8>,
     },
     SaveThemePref(&'static str),
+    SaveThemeJson(String),
     SaveRecents(Vec<Recent>),
     SaveName(String),
     CreateProject {
@@ -169,6 +170,12 @@ enum IoCmd {
     },
 }
 
+struct PluginTheme {
+    command: String,
+    json: String,
+    theme: highlight::Theme,
+}
+
 /// Answers sent back from the Tokio disk worker to `poll`.
 enum IoMsg {
     PrefsLoaded {
@@ -177,6 +184,9 @@ enum IoMsg {
         recents: Vec<Recent>,
         name: String,
         bins: Vec<String>,
+        plugin_commands: Vec<String>,
+        plugin_themes: Vec<PluginTheme>,
+        plugin_note: Option<String>,
     },
     ProjectCreated(PathBuf),
     ProjectListed {
@@ -254,6 +264,8 @@ struct Pen {
     recents: Vec<Recent>,
     display_name: String,
     bins: Vec<String>,
+    plugin_commands: Vec<String>,
+    plugin_themes: Vec<PluginTheme>,
     file_menu_open: bool,
     recent_menu_open: bool,
     settings_open: bool,
@@ -303,6 +315,8 @@ fn init() -> Pen {
         recents: Vec::new(),
         display_name: "Pen".into(),
         bins: Vec::new(),
+        plugin_commands: Vec::new(),
+        plugin_themes: Vec::new(),
         file_menu_open: false,
         recent_menu_open: false,
         settings_open: false,
@@ -392,6 +406,9 @@ fn setup(s: &mut Pen, waker: Waker) {
                             recents: Vec::new(),
                             name: "Pen".into(),
                             bins: Vec::new(),
+                            plugin_commands: Vec::new(),
+                            plugin_themes: Vec::new(),
+                            plugin_note: None,
                         });
                     let _ = msg_tx
                         .send(IoMsg::PrefsLoaded {
@@ -400,6 +417,9 @@ fn setup(s: &mut Pen, waker: Waker) {
                             recents: prefs.recents,
                             name: prefs.name,
                             bins: prefs.bins,
+                            plugin_commands: prefs.plugin_commands,
+                            plugin_themes: prefs.plugin_themes,
+                            plugin_note: prefs.plugin_note,
                         })
                         .await;
                     waker();
@@ -499,6 +519,13 @@ fn setup(s: &mut Pen, waker: Waker) {
                         IoCmd::SaveThemePref(choice) => {
                             let _ = tokio::task::spawn_blocking(move || {
                                 write_theme_pref_blocking(choice)
+                            })
+                            .await;
+                            continue;
+                        }
+                        IoCmd::SaveThemeJson(json) => {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                write_theme_json_blocking(&json)
                             })
                             .await;
                             continue;
@@ -811,12 +838,20 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 recents,
                 name,
                 bins,
+                plugin_commands,
+                plugin_themes,
+                plugin_note,
             } => {
                 s.theme_pref = theme_pref;
                 s.recents = recents;
                 s.display_name = name.clone();
                 s.name_edit = TextEdit::new(&name);
                 s.bins = bins;
+                s.plugin_commands = plugin_commands;
+                s.plugin_themes = plugin_themes;
+                if s.status.is_none() {
+                    s.status = plugin_note;
+                }
                 if first_launch && s.project.is_none() {
                     s.page_opacity = 0.0;
                     s.reveal_first_launch = true;
@@ -1253,6 +1288,16 @@ impl Pen {
 
     fn palette_commands(&self) -> Vec<String> {
         let mut cmds: Vec<String> = BUILTIN_COMMANDS.iter().map(|c| (*c).to_owned()).collect();
+        for cmd in &self.plugin_commands {
+            if !cmds.iter().any(|have| have == cmd) {
+                cmds.push(cmd.clone());
+            }
+        }
+        for theme in &self.plugin_themes {
+            if !cmds.iter().any(|have| have == &theme.command) {
+                cmds.push(theme.command.clone());
+            }
+        }
         for b in &self.git_status.branches {
             cmds.push(format!("Checkout {b}"));
             if self.git_status.current_branch.as_deref() != Some(b.as_str()) {
@@ -1669,6 +1714,22 @@ impl Pen {
                 tx.instant();
             }
             _ => {
+                if let Some(picked) = self
+                    .plugin_themes
+                    .iter()
+                    .find(|theme| theme.command == name)
+                {
+                    let theme = picked.theme.clone();
+                    let json = picked.json.clone();
+                    self.theme_pref = ThemePref::Custom(Box::new(theme.clone()));
+                    self.diff_theme_bg = theme.bg;
+                    self.diff_state.set_highlighter(diff_highlighter(&theme));
+                    if let Some(io_tx) = &self.io_tx {
+                        let _ = io_tx.try_send(IoCmd::SaveThemeJson(json));
+                    }
+                    tx.instant();
+                    return;
+                }
                 if let Some(branch) = name.strip_prefix("Checkout ") {
                     self.request_checkout(branch.to_owned(), tx);
                 } else if let Some(branch) = name.strip_prefix("Merge ") {
@@ -1706,6 +1767,37 @@ struct StartupPrefs {
     recents: Vec<Recent>,
     name: String,
     bins: Vec<String>,
+    plugin_commands: Vec<String>,
+    plugin_themes: Vec<PluginTheme>,
+    plugin_note: Option<String>,
+}
+
+fn load_plugin_prefs(dir: &Path) -> (Vec<String>, Vec<PluginTheme>, Option<String>) {
+    let mut host = pen_plugins::Host {
+        commands: vec![],
+        themes: vec![],
+    };
+    let note = pen_plugins::load_dir(&mut host, dir);
+    let themes = pen_plugins::accepted_themes(&host.themes)
+        .into_iter()
+        .filter_map(|theme| {
+            let command = format!("Use {}", theme.name);
+            if BUILTIN_COMMANDS.contains(&command.as_str()) {
+                return None;
+            }
+            let json = host
+                .themes
+                .iter()
+                .find(|raw| highlight::load_theme(raw).ok().as_ref() == Some(&theme))?
+                .clone();
+            Some(PluginTheme {
+                command,
+                json,
+                theme,
+            })
+        })
+        .collect();
+    (host.commands, themes, note)
 }
 
 /// Startup preferences read on the Tokio worker: theme choice (`theme` or
@@ -1719,6 +1811,9 @@ fn read_startup_prefs_blocking() -> StartupPrefs {
             recents: Vec::new(),
             name: "Pen".into(),
             bins: Vec::new(),
+            plugin_commands: Vec::new(),
+            plugin_themes: Vec::new(),
+            plugin_note: None,
         };
     };
     let cfg = dirs.config();
@@ -1745,6 +1840,7 @@ fn read_startup_prefs_blocking() -> StartupPrefs {
         })
         .map(str::to_owned)
         .collect();
+    let (plugin_commands, plugin_themes, plugin_note) = load_plugin_prefs(&cfg.join("plugins"));
 
     let custom_json = cfg.join("theme.json");
     if let Ok(raw) = std::fs::read_to_string(custom_json)
@@ -1756,6 +1852,9 @@ fn read_startup_prefs_blocking() -> StartupPrefs {
             recents,
             name,
             bins,
+            plugin_commands,
+            plugin_themes,
+            plugin_note,
         };
     }
     let choice_path = cfg.join("theme");
@@ -1774,6 +1873,9 @@ fn read_startup_prefs_blocking() -> StartupPrefs {
         recents,
         name,
         bins,
+        plugin_commands,
+        plugin_themes,
+        plugin_note,
     }
 }
 
@@ -1807,6 +1909,22 @@ fn write_theme_pref_blocking(choice: &str) {
     let tmp = dirs.config().join(".theme.pen-tmp");
     let dst = dirs.config().join("theme");
     if std::fs::write(&tmp, choice.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &dst);
+    }
+    // theme.json wins on the next launch, so Ink and Paper remove it.
+    let _ = std::fs::remove_file(dirs.config().join("theme.json"));
+}
+
+fn write_theme_json_blocking(json: &str) {
+    let Some(dirs) = AppDirs::new("pen") else {
+        return;
+    };
+    if std::fs::create_dir_all(dirs.config()).is_err() {
+        return;
+    }
+    let tmp = dirs.config().join(".theme.json.pen-tmp");
+    let dst = dirs.config().join("theme.json");
+    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
         let _ = std::fs::rename(&tmp, &dst);
     }
 }

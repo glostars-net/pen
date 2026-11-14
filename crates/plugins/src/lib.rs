@@ -102,6 +102,43 @@ struct State {
     themes: Vec<String>,
 }
 
+/// Themes whose JSON `load_theme` accepts. Ink and Paper are not included.
+pub fn accepted_themes(raw: &[String]) -> Vec<highlight::Theme> {
+    raw.iter()
+        .filter_map(|json| highlight::load_theme(json).ok())
+        .collect()
+}
+
+/// Load every `*.wasm` in `dir`. A missing directory adds nothing.
+/// The first trap is reported as `Plugin {name} stopped.`
+pub fn load_dir(host: &mut Host, dir: &std::path::Path) -> Option<String> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    let mut paths: Vec<_> = read
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    paths.retain(|path| path.extension().is_some_and(|ext| ext == "wasm"));
+    paths.sort();
+    let mut note = None;
+    for path in paths {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Err(PluginError::Trap) = host.load(&bytes)
+            && note.is_none()
+        {
+            let name = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "plugin".into());
+            note = Some(format!("Plugin {name} stopped."));
+        }
+    }
+    note
+}
+
 fn accept_command(commands: &mut Vec<String>, name: &str) -> Result<(), PluginError> {
     if name.is_empty() || BUILTIN_COMMANDS.contains(&name) {
         return Err(PluginError::Rejected(name.to_owned()));
@@ -124,6 +161,7 @@ impl bindings::pen::host::host::Host for State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn builtin_command_is_rejected() {
@@ -152,11 +190,43 @@ mod tests {
             commands: vec![],
             themes: vec![],
         };
-        assert_eq!(
-            host.load(b"\0asm\x01\0\0\0"),
-            Err(PluginError::Load)
-        );
+        assert_eq!(host.load(b"\0asm\x01\0\0\0"), Err(PluginError::Load));
         assert!(host.commands.is_empty());
+    }
+
+    #[test]
+    fn bad_theme_json_is_skipped() {
+        let ok = r##"{"name":"Night","bg":"#111111","fg":"#eeeeee"}"##;
+        let themes = accepted_themes(&[ok.into(), "not json".into()]);
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].name, "Night");
+    }
+
+    #[test]
+    fn missing_plugins_dir_adds_nothing() {
+        let mut host = Host {
+            commands: vec![],
+            themes: vec![],
+        };
+        let note = load_dir(&mut host, Path::new("/no/such/pen-plugins"));
+        assert!(note.is_none());
+        assert!(host.commands.is_empty());
+        assert!(host.themes.is_empty());
+    }
+
+    #[test]
+    fn trap_does_not_kill_the_host() {
+        let mut host = Host {
+            commands: vec![],
+            themes: vec![],
+        };
+        assert_eq!(
+            host.load(include_bytes!("../tests/spin.wasm")),
+            Err(PluginError::Trap)
+        );
+        host.register_command("After")
+            .expect("host still accepts commands");
+        assert_eq!(host.commands, vec!["After".to_owned()]);
     }
 
     #[test]

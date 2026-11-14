@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 buffer = { path = "../buffer" }
 highlight = { path = "../highlight" }
+pen-plugins = { path = "../plugins" }
 pen-lsp = { path = "../lsp" }
 pen-git = { path = "../git" }
 project = { path = "../project" }
