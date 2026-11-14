@@ -17,6 +17,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "Use Ink",
     "Use Paper",
     "Go to definition",
+    "OpenCode",
 ];
 
 /// Case-insensitive substring filter over `commands`, preserving order.

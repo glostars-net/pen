@@ -1,6 +1,8 @@
 //! Pen's library surface: bundled fonts, the editor page, theme mapping, and
 //! disk rules shared between the `pen` binary and integration tests.
 
+pub mod agent;
+pub mod agent_write;
 pub mod diagnostics;
 pub mod disk;
 pub mod dock;

@@ -31,6 +31,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "Use Ink",
     "Use Paper",
     "Go to definition",
+    "OpenCode",
 ];
 
 #[derive(Debug, Error, PartialEq, Eq)]

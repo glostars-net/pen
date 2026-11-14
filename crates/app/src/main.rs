@@ -168,6 +168,24 @@ enum IoCmd {
         fallback_note: String,
         refreshes_worktree: bool,
     },
+    StartAgent {
+        root: PathBuf,
+    },
+    AgentPrompt(String),
+    AgentCommitWrite {
+        id: i64,
+        project: Project,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    },
+    AgentAllowPermit {
+        id: i64,
+        option_id: Option<String>,
+    },
+    AgentDeny {
+        id: i64,
+        permit: bool,
+    },
 }
 
 struct PluginTheme {
@@ -218,6 +236,19 @@ enum IoMsg {
     },
     StatusNote(String),
     Error(String),
+    AgentMissing,
+    AgentLine(String),
+    AgentStopped,
+    AgentWrite {
+        id: i64,
+        path: String,
+        bytes: Vec<u8>,
+    },
+    AgentPermit {
+        id: i64,
+        path: String,
+        option_id: Option<String>,
+    },
 }
 
 // The page is the large variant on purpose. Eight bytes of edit revision
@@ -274,6 +305,25 @@ struct Pen {
     project_parent: String,
     project_kind: usize,
     name_edit: TextEdit,
+    agent_pane: PaneState,
+    agent_lines: pen::agent::Transcript,
+    agent_input: TextEdit,
+    agent_missing: bool,
+    agent_stopped: bool,
+    agent_ask: Option<AgentAsk>,
+}
+
+enum AgentAsk {
+    Write {
+        id: i64,
+        path: String,
+        bytes: Vec<u8>,
+    },
+    Permit {
+        id: i64,
+        path: String,
+        option_id: Option<String>,
+    },
 }
 
 fn init() -> Pen {
@@ -325,6 +375,12 @@ fn init() -> Pen {
         project_parent: String::new(),
         project_kind: 0,
         name_edit: TextEdit::new("Pen"),
+        agent_pane: PaneState::new(320.0).range(320.0, 480.0).collapsed(),
+        agent_lines: pen::agent::Transcript { lines: Vec::new() },
+        agent_input: TextEdit::new(""),
+        agent_missing: false,
+        agent_stopped: false,
+        agent_ask: None,
     }
 }
 
@@ -426,6 +482,7 @@ fn setup(s: &mut Pen, waker: Waker) {
                 }
 
                 let mut active_watcher: Option<ProjectWatcher> = None;
+                let mut agent_tx: Option<tokio::sync::mpsc::Sender<pen_acp::Order>> = None;
                 let git_cli_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 while let Some(cmd) = cmd_rx.recv().await {
                     let reply = match cmd {
@@ -753,6 +810,99 @@ fn setup(s: &mut Pen, waker: Waker) {
                             });
                             continue;
                         }
+                        IoCmd::StartAgent { root } => {
+                            if agent_tx.is_some() {
+                                continue;
+                            }
+                            match pen_acp::spawn_opencode(&root) {
+                                Err(pen_acp::AcpError::NotFound) => {
+                                    let _ = msg_tx.send(IoMsg::AgentMissing).await;
+                                    waker();
+                                }
+                                Err(_) => {
+                                    let _ = msg_tx.send(IoMsg::AgentStopped).await;
+                                    waker();
+                                }
+                                Ok(child) => {
+                                    let (order_tx, order_rx) = tokio::sync::mpsc::channel(8);
+                                    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+                                    agent_tx = Some(order_tx);
+                                    let msg = msg_tx.clone();
+                                    let wake = waker.clone();
+                                    tokio::spawn(async move {
+                                        while let Some(event) = event_rx.recv().await {
+                                            let mapped = match event {
+                                                pen_acp::Event::Line(text) => {
+                                                    IoMsg::AgentLine(text)
+                                                }
+                                                pen_acp::Event::Stopped => IoMsg::AgentStopped,
+                                                pen_acp::Event::Write { id, path, bytes } => {
+                                                    IoMsg::AgentWrite { id, path, bytes }
+                                                }
+                                                pen_acp::Event::Permit {
+                                                    id,
+                                                    path,
+                                                    option_id,
+                                                } => IoMsg::AgentPermit {
+                                                    id,
+                                                    path,
+                                                    option_id,
+                                                },
+                                            };
+                                            if msg.send(mapped).await.is_err() {
+                                                break;
+                                            }
+                                            wake();
+                                        }
+                                    });
+                                    tokio::spawn(pen_acp::serve(child, root, order_rx, event_tx));
+                                }
+                            }
+                            continue;
+                        }
+                        IoCmd::AgentPrompt(text) => {
+                            if let Some(tx) = &agent_tx {
+                                let _ = tx.send(pen_acp::Order::Prompt(text)).await;
+                            }
+                            continue;
+                        }
+                        IoCmd::AgentCommitWrite {
+                            id,
+                            project,
+                            path,
+                            bytes,
+                        } => {
+                            let rel = path.strip_prefix(&project.root).unwrap_or(path.as_path());
+                            let wrote = project.write_atomic(rel, &bytes);
+                            if let Some(tx) = &agent_tx {
+                                let order = if wrote.is_ok() {
+                                    pen_acp::Order::AllowWrite(id)
+                                } else {
+                                    pen_acp::Order::Deny { id, permit: false }
+                                };
+                                let _ = tx.send(order).await;
+                            }
+                            if let Err(project::ProjectError::OutsideRoot { .. }) = wrote {
+                                let _ = msg_tx
+                                    .send(IoMsg::StatusNote("Path is outside the folder.".into()))
+                                    .await;
+                                waker();
+                            }
+                            continue;
+                        }
+                        IoCmd::AgentAllowPermit { id, option_id } => {
+                            if let Some(tx) = &agent_tx {
+                                let _ =
+                                    tx.send(pen_acp::Order::AllowPermit { id, option_id }).await;
+                            }
+                            continue;
+                        }
+                        IoCmd::AgentDeny { id, permit } => {
+                            if let Some(tx) = &agent_tx {
+                                let _ = tx.send(pen_acp::Order::Deny { id, permit }).await;
+                            }
+                            continue;
+                        }
                     };
                     let _ = &active_watcher;
                     if msg_tx.send(reply).await.is_err() {
@@ -1035,6 +1185,37 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
             }
             IoMsg::Error(err) => {
                 s.status = Some(err);
+                tx.instant();
+            }
+            IoMsg::AgentMissing => {
+                s.agent_missing = true;
+                tx.instant();
+            }
+            IoMsg::AgentLine(line) => {
+                s.agent_lines.push_agent(&line);
+                tx.instant();
+            }
+            IoMsg::AgentStopped => {
+                if !s.agent_stopped {
+                    s.agent_stopped = true;
+                    s.agent_lines.push_agent("OpenCode stopped.");
+                }
+                tx.instant();
+            }
+            IoMsg::AgentWrite { id, path, bytes } => {
+                s.agent_ask = Some(AgentAsk::Write { id, path, bytes });
+                tx.instant();
+            }
+            IoMsg::AgentPermit {
+                id,
+                path,
+                option_id,
+            } => {
+                s.agent_ask = Some(AgentAsk::Permit {
+                    id,
+                    path,
+                    option_id,
+                });
                 tx.instant();
             }
         }
@@ -1622,6 +1803,94 @@ impl Pen {
         self.close_commit_bar(tx);
     }
 
+    fn file_is_dirty(&self, rel: &Path) -> bool {
+        if self.unsaved.contains_key(rel) {
+            return true;
+        }
+        self.active_path.as_deref() == Some(rel)
+            && matches!(&self.page, OpenPage::Editor(ed) if ed.buffer.is_dirty())
+    }
+
+    fn submit_agent(&mut self, tx: &mut Tx) {
+        let text = self.agent_input.text.trim().to_owned();
+        if text.is_empty() || self.agent_missing || self.agent_stopped {
+            return;
+        }
+        self.agent_lines.push_user(&text);
+        self.agent_input = TextEdit::new("");
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::AgentPrompt(text));
+        }
+        tx.instant();
+    }
+
+    fn toggle_agent(&mut self, tx: &mut Tx) {
+        self.agent_pane.toggle();
+        if self.agent_pane.is_open() {
+            let Some(project) = &self.project else {
+                self.status = Some("Open a folder first.".into());
+                tx.instant();
+                return;
+            };
+            if let Some(io_tx) = &self.io_tx {
+                let _ = io_tx.try_send(IoCmd::StartAgent {
+                    root: project.root.clone(),
+                });
+            }
+        }
+        tx.instant();
+    }
+
+    fn answer_agent(&mut self, allow: bool, tx: &mut Tx) {
+        let Some(ask) = self.agent_ask.take() else {
+            return;
+        };
+        let Some(io_tx) = &self.io_tx else {
+            return;
+        };
+        match ask {
+            AgentAsk::Write { id, path, bytes } => {
+                let Some(project) = self.project.clone() else {
+                    let _ = io_tx.try_send(IoCmd::AgentDeny { id, permit: false });
+                    return;
+                };
+                let rel = Path::new(&path)
+                    .strip_prefix(&project.root)
+                    .unwrap_or(Path::new(&path));
+                let decision = pen::agent_write::decide_write(self.file_is_dirty(rel), allow);
+                match decision {
+                    pen::agent_write::WriteDecision::Allow => {
+                        let _ = io_tx.try_send(IoCmd::AgentCommitWrite {
+                            id,
+                            project,
+                            path: PathBuf::from(&path),
+                            bytes,
+                        });
+                    }
+                    pen::agent_write::WriteDecision::Dirty => {
+                        self.status = Some("Changed on disk. Your copy is kept.".into());
+                        let _ = io_tx.try_send(IoCmd::AgentDeny { id, permit: false });
+                    }
+                    pen::agent_write::WriteDecision::Denied => {
+                        let _ = io_tx.try_send(IoCmd::AgentDeny { id, permit: false });
+                    }
+                }
+            }
+            AgentAsk::Permit {
+                id,
+                path: _,
+                option_id,
+            } => {
+                if allow {
+                    let _ = io_tx.try_send(IoCmd::AgentAllowPermit { id, option_id });
+                } else {
+                    let _ = io_tx.try_send(IoCmd::AgentDeny { id, permit: true });
+                }
+            }
+        }
+        tx.instant();
+    }
+
     fn run_command(&mut self, name: &str, tx: &mut Tx) {
         self.close_palette(tx);
         match name {
@@ -1631,6 +1900,7 @@ impl Pen {
             }
             "Find" => self.open_find(tx),
             "Go to definition" => self.go_to_definition(tx),
+            "OpenCode" => self.toggle_agent(tx),
             "Stage file" => {
                 let target = self
                     .active_path
@@ -1929,6 +2199,30 @@ fn write_theme_json_blocking(json: &str) {
     }
 }
 
+fn agent_pane(s: &Pen, theme: &Theme) -> El {
+    let faint = rgb_color(theme.faint);
+    let fg = rgb_color(theme.fg);
+    let input = if s.agent_missing {
+        None
+    } else {
+        Some(
+            text_input(&s.agent_input, UI_FONT)
+                .key("pen/agent-input")
+                .label("Message")
+                .single_line()
+                .placeholder("Message", faint)
+                .color(fg)
+                .caret(fg, fg.alpha(0.12))
+                .w_full()
+                .h(28.0)
+                .transition(Transition::none())
+                .on_edit(|s: &mut Pen| &mut s.agent_input)
+                .on_submit(|s: &mut Pen, tx: &mut Tx| s.submit_agent(tx)),
+        )
+    };
+    pen::agent::agent_column(&s.agent_lines.lines, s.agent_missing, theme, input)
+}
+
 fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     let theme = s.theme_pref.resolve(cx.system_dark());
     let bg = rgb_color(theme.bg);
@@ -2019,6 +2313,19 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
             |s: &mut Pen| &mut s.git_panel.commit_message,
             |s: &mut Pen, tx: &mut Tx| s.submit_commit(tx),
             |s: &mut Pen, tx: &mut Tx| s.close_commit_bar(tx),
+        ));
+    }
+    if let Some(ask) = &s.agent_ask {
+        let prompt = match ask {
+            AgentAsk::Write { path, .. } | AgentAsk::Permit { path, .. } => {
+                format!("Allow OpenCode to write {path}?")
+            }
+        };
+        page_stack = page_stack.child(confirm_bar(
+            &prompt,
+            &theme,
+            |s: &mut Pen, tx: &mut Tx| s.answer_agent(true, tx),
+            |s: &mut Pen, tx: &mut Tx| s.answer_agent(false, tx),
         ));
     }
     if let Some(confirm) = &s.git_panel.confirm {
@@ -2234,8 +2541,10 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     }
     sidebar = sidebar.child(sidebar_body);
 
+    let agent = agent_pane(s, &theme);
     let mut split = SplitView::new(page_stack)
         .sidebar(&s.sidebar, |s: &mut Pen| &mut s.sidebar, sidebar)
+        .inspector(&s.agent_pane, |s: &mut Pen| &mut s.agent_pane, agent)
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
         .pane_motion(PaneMotion::new().spring(Spring::new(0.35, 0.0)))

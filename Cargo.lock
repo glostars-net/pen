@@ -3953,6 +3953,7 @@ version = "0.1.0"
 dependencies = [
  "buffer",
  "highlight",
+ "pen-acp",
  "pen-git",
  "pen-lsp",
  "pen-plugins",
@@ -3960,6 +3961,15 @@ dependencies = [
  "rune",
  "rune-kit",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pen-acp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
