@@ -152,6 +152,12 @@ Gate verified on `rustc 1.99.1` against pinned Rune rev
   - **Monochrome ink-step diff:** confirmed (`theme.added` and `theme.removed` derive from contrast-checked `>= 4.5:1` OKLab ink steps mapped onto `rune_kit::DiffView`, paired with a five-step monochrome `diff_highlighter`; zero green/red diff bars or rainbow syntax).
   - **Tree & Changes status labels:** confirmed (`+n −n` using true minus `U+2212` for tracked modifications and `new` for untracked files in `theme.faint` tabular numerals; no colored status dot).
 
+## Phase 5
+
+OpenCode is a child process: `opencode acp`, newline-delimited JSON-RPC, method `session/prompt`. If `opencode` is not on `PATH`, the status line is "OpenCode is not installed." and the editor still opens. The panel is a solid 320pt column titled OpenCode. Messages do not animate. A write asks "Allow OpenCode to write {path}?" and then goes through `Project::write_atomic` only when the buffer is clean and the user allows it. A dirty buffer stays "Changed on disk. Your copy is kept." When the child exits, the panel says "OpenCode stopped." and Pen does not respawn it.
+
+Claude Code is not a child process. Its file changes use the phase 1 watcher. A dirty buffer is kept. This phase adds no Claude socket.
+
 ## Phase 4
 
 Plugins are optional WASM components in `plugins/` next to `theme.json`. Pen does not download them. A plugin may register a command and a theme JSON string. It cannot read the disk, open a socket, or draw UI. A command that matches a built-in name is rejected. Theme JSON goes through `load_theme`; a bad file is skipped and does not replace Ink or Paper. A trap stops that plugin and the editor keeps running. With no plugins directory, the palette gained no rows. Confirmed by `missing_plugins_dir_adds_nothing`. This session did not open a window.
