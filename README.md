@@ -154,9 +154,9 @@ Gate verified on `rustc 1.99.1` against pinned Rune rev
 
 ## Phase 3b
 
-The empty window is a home screen: `Open a folder`, `New project`, and up to eight recent folders that still exist. A `File` menu sits at the leading edge of the toolbar. Settings is a page for appearance and a display name. The file tree uses the ink marks in `assets/icons/files/`. A new project is created from a local catalog; a row is hidden when its tool is not installed. The terminal dock slot exists and is not shown.
+The empty window is a home screen: `Open a folder`, `New project`, and up to sixteen recent folders that still exist, with Pin and Remove. On macOS, File is in the menu bar with Edit and Window. On Windows and Linux, File is a menu in the window. Settings is a page for appearance and a display name. The file tree uses the ink marks in `assets/icons/files/`. A new project is created from a local catalog; a row is hidden when its tool is not installed. The terminal dock slot exists and is not shown.
 
-With no recent folders, the home screen shows the two actions and no Recent heading.
+With no recent folders, the home screen shows the two actions, Settings, and no Recent heading.
 
 ## Phase 3
 

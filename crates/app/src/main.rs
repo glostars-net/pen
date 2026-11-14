@@ -5,9 +5,11 @@
 //! disk or watcher work; a Tokio worker handles all filesystem calls and wakes
 //! the window via `Waker`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use buffer::Buffer;
@@ -25,7 +27,7 @@ use pen::git_panel::{
 };
 use pen::lsp_host::{self, LspCmd, LspEvent};
 use pen::palette::{BUILTIN_COMMANDS, filter_command_list, shortcut_hint};
-use pen::recents::{self, from_json, to_json};
+use pen::recents::{self, Recent, from_json, to_json};
 use pen::scaffold::{self, reject_name};
 use pen::settings::parse_name;
 use pen::theme_kit::{UI_FONT, UI_MEDIUM_FONT, build_kit, diff_highlighter, rgb_color};
@@ -57,6 +59,24 @@ const FIND_FONT: TextStyle = TextStyle {
     optical_size: OpticalSize::Auto,
     italic: false,
 };
+
+/// Home title: 22px medium, tracking -0.02em (-0.44pt).
+const HOME_TITLE_FONT: TextStyle = TextStyle {
+    size: 22.0,
+    weight: 500.0,
+    family: Family::Sans,
+    line_height: 28.0,
+    tracking: -0.44,
+    variations: "",
+    features: "",
+    optical_size: OpticalSize::Auto,
+    italic: false,
+};
+
+static FILE_MENU: OnceLock<rune::AppHandle<Pen>> = OnceLock::new();
+thread_local! {
+    static FILE_MENU_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 #[derive(Clone, Debug)]
 enum ThemePref {
@@ -101,7 +121,7 @@ enum IoCmd {
         bytes: Vec<u8>,
     },
     SaveThemePref(&'static str),
-    SaveRecents(Vec<PathBuf>),
+    SaveRecents(Vec<Recent>),
     SaveName(String),
     CreateProject {
         parent: PathBuf,
@@ -154,7 +174,7 @@ enum IoMsg {
     PrefsLoaded {
         theme_pref: ThemePref,
         first_launch: bool,
-        recents: Vec<PathBuf>,
+        recents: Vec<Recent>,
         name: String,
         bins: Vec<String>,
     },
@@ -231,7 +251,7 @@ struct Pen {
     lsp_rx: Option<std::sync::mpsc::Receiver<LspEvent>>,
     lsp_rev: u64,
     pending_jump: Option<(PathBuf, usize)>,
-    recents: Vec<PathBuf>,
+    recents: Vec<Recent>,
     display_name: String,
     bins: Vec<String>,
     file_menu_open: bool,
@@ -1683,7 +1703,7 @@ fn tree_label(n: &FileNode<PathBuf>) -> &str {
 struct StartupPrefs {
     theme_pref: ThemePref,
     first_launch: bool,
-    recents: Vec<PathBuf>,
+    recents: Vec<Recent>,
     name: String,
     bins: Vec<String>,
 }
@@ -1757,7 +1777,7 @@ fn read_startup_prefs_blocking() -> StartupPrefs {
     }
 }
 
-fn write_recents_blocking(list: &[PathBuf]) {
+fn write_recents_blocking(list: &[Recent]) {
     let Some(dirs) = AppDirs::new("pen") else {
         return;
     };
@@ -1859,12 +1879,18 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         }
     };
 
+    let mut menu_layer = Vec::new();
+    sync_file_menu(s);
     let mut page_stack = col()
         .key("pen/main")
         .w_full()
         .h_full()
         .fill(bg)
         .border_sides([1.0, 0.0, 0.0, 0.0], rule);
+    if !cfg!(target_os = "macos") {
+        // Ruling: this band is the title bar, so File sits under it, not above it.
+        page_stack = page_stack.child(file_menu(s, &theme, &k, &mut menu_layer));
+    }
     if s.find_open {
         page_stack = page_stack.child(find_bar(s, &theme));
     }
@@ -1906,9 +1932,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         );
     }
 
-    let mut menu_layer = Vec::new();
-    let file = file_menu(s, &theme, &k, &mut menu_layer);
-    let mut toolbar = Toolbar::new().title("Pen").leading(file);
+    let mut toolbar = Toolbar::new().title("Pen");
     if let Some(rel) = &s.active_path {
         let dirty = matches!(&s.page, OpenPage::Editor(ed) if ed.buffer.is_dirty());
         let label = if dirty {
@@ -2110,29 +2134,252 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     rune_kit::root(shell_el, overlays)
 }
 
+fn folder_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn save_recents(s: &Pen) {
+    if let Some(io_tx) = &s.io_tx {
+        let _ = io_tx.try_send(IoCmd::SaveRecents(s.recents.clone()));
+    }
+}
+
+fn recent_row(
+    i: usize,
+    recent: &Recent,
+    fg: rune::Color,
+    faint: rune::Color,
+    rule: rune::Color,
+) -> El {
+    let name = folder_label(&recent.path);
+    let parent = recent
+        .path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let open_path = recent.path.clone();
+    let pin_path = recent.path.clone();
+    let remove_path = recent.path.clone();
+    let pin_label = if recent.pinned { "Unpin" } else { "Pin" };
+    row()
+        .key(format!("pen/recent-{i}"))
+        .w_full()
+        .h(36.0)
+        .center_y()
+        .gap(12.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], rule)
+        .transition(Transition::none())
+        .child(
+            row()
+                .key(format!("pen/recent-open-{i}"))
+                .role("button")
+                .label(name.clone())
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(12.0)
+                .center_y()
+                .cursor(Cursor::Pointer)
+                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+                    if let Some(io_tx) = &s.io_tx {
+                        let _ = io_tx.try_send(IoCmd::OpenProject(open_path.clone()));
+                    }
+                    tx.instant();
+                })
+                .child(text(name).font(UI_FONT).color(fg).truncate())
+                .child(text(parent).font(UI_FONT).color(faint).truncate()),
+        )
+        .child(
+            text_control(format!("pen/recent-pin-{i}"), pin_label, faint).on_press_tx(
+                move |s: &mut Pen, tx: &mut Tx| {
+                    let pinned = s
+                        .recents
+                        .iter()
+                        .find(|r| r.path == pin_path)
+                        .is_some_and(|r| r.pinned);
+                    s.recents = recents::pin(&s.recents, &pin_path, !pinned);
+                    save_recents(s);
+                    tx.instant();
+                },
+            ),
+        )
+        .child(
+            text_control(format!("pen/recent-remove-{i}"), "Remove", faint).on_press_tx(
+                move |s: &mut Pen, tx: &mut Tx| {
+                    s.recents = recents::remove(&s.recents, &remove_path);
+                    save_recents(s);
+                    tx.instant();
+                },
+            ),
+        )
+}
+
+fn text_control(key: String, label: &'static str, color: rune::Color) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(label)
+        .focusable(true)
+        .cursor(Cursor::Pointer)
+        .h(28.0)
+        .center_y()
+        .transition(Transition::none())
+        .child(text(label).font(UI_FONT).color(color))
+}
+
+fn file_menu_key(s: &Pen) -> String {
+    let mut key = String::from(if s.project.is_some() { "1" } else { "0" });
+    for recent in recents::menu_slice(&s.recents) {
+        key.push('\n');
+        key.push_str(&recent.path.to_string_lossy());
+    }
+    key
+}
+
+fn with_chord(item: rune::MenuItem<Pen>, spec: &str) -> rune::MenuItem<Pen> {
+    match spec.parse() {
+        Ok(shortcut) => item.key_equivalent(shortcut).keys_first(),
+        Err(_) => item,
+    }
+}
+
+fn save_from_menu(s: &mut Pen, tx: &mut Tx) {
+    s.request_save();
+    let _ = tx;
+}
+
+fn open_recent_at(s: &mut Pen, tx: &mut Tx, index: usize) {
+    let Some(path) = recents::menu_slice(&s.recents)
+        .get(index)
+        .map(|r| r.path.clone())
+    else {
+        return;
+    };
+    if let Some(io_tx) = &s.io_tx {
+        let _ = io_tx.try_send(IoCmd::OpenProject(path));
+    }
+    tx.instant();
+}
+
+macro_rules! recent_action {
+    ($name:ident, $index:literal) => {
+        fn $name(s: &mut Pen, tx: &mut Tx) {
+            open_recent_at(s, tx, $index);
+        }
+    };
+}
+recent_action!(open_recent_0, 0);
+recent_action!(open_recent_1, 1);
+recent_action!(open_recent_2, 2);
+recent_action!(open_recent_3, 3);
+recent_action!(open_recent_4, 4);
+recent_action!(open_recent_5, 5);
+recent_action!(open_recent_6, 6);
+recent_action!(open_recent_7, 7);
+
+const RECENT_ACTIONS: [fn(&mut Pen, &mut Tx); 8] = [
+    open_recent_0,
+    open_recent_1,
+    open_recent_2,
+    open_recent_3,
+    open_recent_4,
+    open_recent_5,
+    open_recent_6,
+    open_recent_7,
+];
+
+fn native_file_items(s: &Pen) -> Vec<rune::MenuItem<Pen>> {
+    debug_assert_eq!(recents::MENU_CAP, RECENT_ACTIONS.len());
+    let mut items = vec![
+        rune::MenuItem::new("New project", Pen::open_new_project)
+            .menu("File")
+            .id("pen.new"),
+        with_chord(
+            rune::MenuItem::new("Open folder", Pen::prompt_open_folder)
+                .menu("File")
+                .id("pen.open"),
+            "mod+o",
+        ),
+    ];
+    if s.project.is_some() {
+        items.push(with_chord(
+            rune::MenuItem::new("Save", save_from_menu)
+                .menu("File")
+                .id("pen.save"),
+            "mod+s",
+        ));
+        items.push(with_chord(
+            rune::MenuItem::new("Find", Pen::open_find)
+                .menu("File")
+                .id("pen.find"),
+            "mod+f",
+        ));
+    }
+    // shortcut: rune::MenuItem has no submenu. Recent names are flat File items. Upgrade when Rune grows a submenu.
+    for (i, recent) in recents::menu_slice(&s.recents).iter().enumerate() {
+        let Some(action) = RECENT_ACTIONS.get(i).copied() else {
+            break;
+        };
+        items.push(
+            rune::MenuItem::new(folder_label(&recent.path), action)
+                .menu("File")
+                .id(format!("pen.recent.{i}")),
+        );
+    }
+    items.push(rune::MenuItem::separator().menu("File"));
+    items.push(
+        rune::MenuItem::new("Settings", Pen::open_settings)
+            .menu("File")
+            .id("pen.settings"),
+    );
+    if s.project.is_some() {
+        items.push(
+            rune::MenuItem::new("Close folder", Pen::close_folder)
+                .menu("File")
+                .id("pen.close"),
+        );
+    }
+    items
+}
+
+fn sync_file_menu(s: &Pen) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let key = file_menu_key(s);
+    let same = FILE_MENU_KEY.with(|slot| slot.borrow().as_deref() == Some(key.as_str()));
+    if same {
+        return;
+    }
+    let Some(handle) = FILE_MENU.get() else {
+        return;
+    };
+    match handle.set_menu(native_file_items(s)) {
+        Err(rune::MenuError::NotRunning) => {}
+        _ => FILE_MENU_KEY.with(|slot| *slot.borrow_mut() = Some(key)),
+    }
+}
+
 fn file_menu(s: &Pen, theme: &Theme, k: &rune_kit::Kit, layer: &mut Vec<El>) -> El {
     let fg = rgb_color(theme.fg);
-    let faint = rgb_color(theme.faint);
-    let mut trigger = col()
+    let rule = fg.alpha(0.20);
+    let trigger = row()
         .key("pen/file-trigger")
+        .w_full()
+        .h(28.0)
+        .px(16.0)
+        .center_y()
         .cursor(Cursor::Pointer)
         .transition(Transition::none())
-        .h(32.0)
-        .px(12.0)
-        .radius(6.0)
-        .center()
-        .border(1.0, fg.alpha(0.20))
-        .hover(fg.alpha(0.06))
-        .press(fg.alpha(0.12))
+        .border_sides([0.0, 0.0, 1.0, 0.0], rule)
         .on_press_tx(|s: &mut Pen, tx: &mut Tx| {
             s.file_menu_open = !s.file_menu_open;
             s.recent_menu_open = false;
-            let _ = tx;
+            tx.instant();
         })
         .child(text("File").font(UI_FONT).color(fg));
-    if s.display_name != "Pen" {
-        trigger = trigger.child(text(s.display_name.clone()).font(UI_FONT).color(faint));
-    }
     let mut menu = Menu::new("pen/file")
         .trigger(trigger)
         .item(
@@ -2169,16 +2416,13 @@ fn file_menu(s: &Pen, theme: &Theme, k: &rune_kit::Kit, layer: &mut Vec<El>) -> 
                     }),
             );
     }
-    if !s.recents.is_empty() {
-        let entries: Vec<MenuEntry> = s
-            .recents
+    let recent_rows = recents::menu_slice(&s.recents);
+    if !recent_rows.is_empty() {
+        let entries: Vec<MenuEntry> = recent_rows
             .iter()
-            .map(|path| {
-                let label = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                let open_path = path.clone();
+            .map(|recent| {
+                let label = folder_label(&recent.path);
+                let open_path = recent.path.clone();
                 MenuEntry::item(MenuItem::new(label).on_select_tx(
                     move |s: &mut Pen, tx: &mut Tx| {
                         s.file_menu_open = false;
@@ -2442,7 +2686,7 @@ fn home_button(key: &'static str, label: &'static str, theme: &Theme) -> El {
         .child(text(label).font(UI_MEDIUM_FONT).color(fg))
 }
 
-/// Home screen. Replaces the lone "Open a folder" control.
+/// Home library. Left aligned, not a centered card.
 fn home_screen(s: &Pen, theme: &Theme) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
@@ -2452,61 +2696,49 @@ fn home_screen(s: &Pen, theme: &Theme) -> El {
         .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.prompt_open_folder(tx));
     let new_project = home_button("pen/new-project", "New project", theme)
         .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.open_new_project(tx));
-    let mut page = col()
-        .key("pen/home")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .fill(bg)
-        .center()
-        .gap(16.0)
-        .opacity(s.page_opacity)
-        .opacity_motion(Spring::new(0.20, 0.0))
+    let settings = row()
+        .key("pen/home-settings")
+        .role("button")
+        .label("Settings")
+        .focusable(true)
+        .cursor(Cursor::Pointer)
+        .h(28.0)
+        .center_y()
         .transition(Transition::none())
-        .child(text("Pen").font(UI_MEDIUM_FONT).color(fg))
+        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.open_settings(tx))
+        .child(text("Settings").font(UI_FONT).color(faint));
+    let mut body = col()
+        .key("pen/home-body")
+        .w(560.0)
+        .gap(16.0)
+        .child(text(s.display_name.clone()).font(HOME_TITLE_FONT).color(fg))
         .child(
             text("Open a folder, or start a new one.")
                 .font(UI_FONT)
                 .color(faint),
         )
-        .child(row().gap(8.0).child(open).child(new_project));
+        .child(row().gap(8.0).child(open).child(new_project))
+        .child(settings);
     if !s.recents.is_empty() {
-        let mut list = col().key("pen/recents").w(440.0).gap(0.0);
+        let mut list = col().key("pen/recents").w_full().gap(0.0);
         list = list.child(text("Recent").font(UI_FONT).color(faint));
-        for (i, path) in s.recents.iter().enumerate() {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let parent = path
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            let open_path = path.clone();
-            list = list.child(
-                row()
-                    .key(format!("pen/recent-{i}"))
-                    .w_full()
-                    .h(34.0)
-                    .px(0.0)
-                    .center_y()
-                    .gap(12.0)
-                    .border_sides([0.0, 0.0, 1.0, 0.0], rule)
-                    .cursor(Cursor::Pointer)
-                    .transition(Transition::none())
-                    .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
-                        if let Some(io_tx) = &s.io_tx {
-                            let _ = io_tx.try_send(IoCmd::OpenProject(open_path.clone()));
-                        }
-                        tx.instant();
-                    })
-                    .child(text(name).font(UI_FONT).color(fg))
-                    .child(text(parent).font(UI_FONT).color(faint)),
-            );
+        for (i, recent) in s.recents.iter().enumerate() {
+            list = list.child(recent_row(i, recent, fg, faint, rule));
         }
-        page = page.child(list);
+        body = body.child(list);
     }
-    page
+    col()
+        .key("pen/home")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(bg)
+        .pt(48.0)
+        .pl(48.0)
+        .opacity(s.page_opacity)
+        .opacity_motion(Spring::new(0.20, 0.0))
+        .transition(Transition::none())
+        .child(body)
 }
 
 /// Single-line Find bar pinned directly above the writing surface (never a dialog).
@@ -2846,8 +3078,14 @@ const SCENES: &[(&str, SceneFn)] = &[
     ("home-paper", |s| {
         s.theme_pref = ThemePref::Paper;
         s.recents = vec![
-            PathBuf::from("/Users/aj/Developer/projects/pen"),
-            PathBuf::from("/Users/aj/notes"),
+            Recent {
+                path: PathBuf::from("/Users/aj/Developer/projects/pen"),
+                pinned: false,
+            },
+            Recent {
+                path: PathBuf::from("/Users/aj/notes"),
+                pinned: true,
+            },
         ];
     }),
     ("empty-ink", |s| {
@@ -3047,5 +3285,10 @@ fn main() {
         on_key: Some(on_key),
         ..AppSpec::new("Pen", (1100.0, 720.0), init, view)
     };
-    rune::App::new(spec).chrome(chrome).on_ime(on_ime).run();
+    let app = rune::App::new(spec)
+        .chrome(chrome)
+        .on_ime(on_ime)
+        .standard_menus();
+    let _ = FILE_MENU.set(app.handle());
+    app.run();
 }
