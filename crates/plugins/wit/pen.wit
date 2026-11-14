@@ -1,0 +1,11 @@
+package pen:host@0.1.0;
+
+interface host {
+  register-command: func(name: string) -> result<_, string>;
+  register-theme: func(json: string) -> result<_, string>;
+}
+
+world pen {
+  import host;
+  export init: func();
+}
