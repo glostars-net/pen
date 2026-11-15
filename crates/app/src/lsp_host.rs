@@ -36,12 +36,22 @@ pub enum LspCmd {
         line: u32,
         character: u32,
     },
+    Complete {
+        rel: PathBuf,
+        line: u32,
+        character: u32,
+        generation: u64,
+    },
 }
 
 pub enum LspEvent {
     Diagnostics(DiagSnapshot),
     Status(String),
     Jump(Jump),
+    Completion {
+        generation: u64,
+        label: Option<String>,
+    },
 }
 
 struct Running {
@@ -118,6 +128,25 @@ fn host(rx: Receiver<LspCmd>, tx: SyncSender<LspEvent>, wake: impl Fn()) {
             }) => {
                 if let Some(session) = &mut session {
                     session.define(&rel, line, character, &tx, &wake);
+                }
+            }
+            Ok(LspCmd::Complete {
+                rel,
+                line,
+                character,
+                generation,
+            }) => {
+                if let Some(session) = &mut session {
+                    session.complete(&rel, line, character, generation, &tx, &wake);
+                } else {
+                    emit(
+                        &tx,
+                        &wake,
+                        LspEvent::Completion {
+                            generation,
+                            label: None,
+                        },
+                    );
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -306,6 +335,32 @@ impl Session {
             Some(jump) => emit(tx, wake, LspEvent::Jump(jump)),
             None => emit(tx, wake, LspEvent::Status("No definition.".into())),
         }
+    }
+
+    fn complete(
+        &mut self,
+        rel: &Path,
+        line: u32,
+        character: u32,
+        generation: u64,
+        tx: &SyncSender<LspEvent>,
+        wake: &impl Fn(),
+    ) {
+        let language = lang_for_path(&rel.to_string_lossy()).unwrap_or("plaintext");
+        let mut label = None;
+        for server in &mut self.servers {
+            if server.spec.language != language {
+                continue;
+            }
+            let Some(client) = &mut server.client else {
+                continue;
+            };
+            if let Ok(result) = client.completion(rel, line, character) {
+                label = crate::complete::completion_label(&result);
+                break;
+            }
+        }
+        emit(tx, wake, LspEvent::Completion { generation, label });
     }
 
     fn publish(&self, tx: &SyncSender<LspEvent>, wake: &impl Fn()) {

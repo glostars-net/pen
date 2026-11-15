@@ -18,6 +18,8 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "Use Paper",
     "Go to definition",
     "OpenCode",
+    "Terminal",
+    "Clone repository",
     "Zoom in",
     "Zoom out",
     "Reset zoom",

@@ -18,6 +18,7 @@ buffer = { path = "../buffer" }
 highlight = { path = "../highlight" }
 pen-acp = { path = "../acp" }
 pen-plugins = { path = "../plugins" }
+pen-term = { path = "../term" }
 pen-lsp = { path = "../lsp" }
 pen-git = { path = "../git" }
 project = { path = "../project" }

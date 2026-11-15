@@ -23,7 +23,7 @@ use pen::git_guard::{CheckoutDecision, decide_checkout};
 use pen::git_panel::{
     GitPanelState, GitSnapshot, PendingConfirm, SidebarMode, branches_section, changes_section,
     coalesce_latest_root, commit_bar, confirm_bar, diff_page_view, git_dock_container,
-    git_remote_bar, history_section, status_label, worktrees_section,
+    git_remote_bar, history_section, worktrees_section,
 };
 use pen::keys::{self, Chord};
 use pen::lsp_host::{self, LspCmd, LspEvent};
@@ -187,6 +187,14 @@ enum IoCmd {
         id: i64,
         permit: bool,
     },
+    StartTerm {
+        root: PathBuf,
+    },
+    TermBytes(Vec<u8>),
+    CloneRepo {
+        parent: PathBuf,
+        url: String,
+    },
 }
 
 struct PluginTheme {
@@ -250,6 +258,9 @@ enum IoMsg {
         path: String,
         option_id: Option<String>,
     },
+    TermRows(Vec<String>),
+    TermMissing,
+    TermStopped,
 }
 
 // The page is the large variant on purpose. Eight bytes of edit revision
@@ -312,6 +323,22 @@ struct Pen {
     agent_missing: bool,
     agent_stopped: bool,
     agent_ask: Option<AgentAsk>,
+    term_open: bool,
+    term_side: bool,
+    term_rows: Vec<String>,
+    term_missing: bool,
+    term_stopped: bool,
+    term_focused: bool,
+    clone_open: bool,
+    clone_url: TextEdit,
+    complete_gen: u64,
+    pending_complete: Option<PendingComplete>,
+}
+
+struct PendingComplete {
+    generation: u64,
+    prefix_len: usize,
+    fallback: Option<String>,
 }
 
 enum AgentAsk {
@@ -382,6 +409,16 @@ fn init() -> Pen {
         agent_missing: false,
         agent_stopped: false,
         agent_ask: None,
+        term_open: false,
+        term_side: false,
+        term_rows: Vec::new(),
+        term_missing: false,
+        term_stopped: false,
+        term_focused: false,
+        clone_open: false,
+        clone_url: TextEdit::new(""),
+        complete_gen: 0,
+        pending_complete: None,
     }
 }
 
@@ -484,6 +521,8 @@ fn setup(s: &mut Pen, waker: Waker) {
 
                 let mut active_watcher: Option<ProjectWatcher> = None;
                 let mut agent_tx: Option<tokio::sync::mpsc::Sender<pen_acp::Order>> = None;
+                let mut term_writer: Option<Box<dyn std::io::Write + Send>> = None;
+                let mut term_live = false;
                 let git_cli_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 while let Some(cmd) = cmd_rx.recv().await {
                     let reply = match cmd {
@@ -904,6 +943,106 @@ fn setup(s: &mut Pen, waker: Waker) {
                             }
                             continue;
                         }
+                        IoCmd::StartTerm { root } => {
+                            if term_live {
+                                continue;
+                            }
+                            let shell = std::env::var("SHELL").ok();
+                            let program = std::env::var_os("PATH").and_then(|path| {
+                                std::env::split_paths(&path)
+                                    .find_map(|dir| pen_term::default_shell(&dir, shell.as_deref()))
+                            });
+                            let Some(program) = program else {
+                                let _ = msg_tx.send(IoMsg::TermMissing).await;
+                                waker();
+                                continue;
+                            };
+                            match pen_term::Shell::spawn(&program, &root) {
+                                Err(_) => {
+                                    let _ = msg_tx.send(IoMsg::TermStopped).await;
+                                    waker();
+                                }
+                                Ok((shell_proc, mut reader)) => {
+                                    term_live = true;
+                                    term_writer = Some(shell_proc.writer);
+                                    let hold = shell_proc.child;
+                                    let msg = msg_tx.clone();
+                                    let wake = waker.clone();
+                                    std::thread::spawn(move || {
+                                        let _hold = hold;
+                                        let mut buf = [0u8; 4096];
+                                        let mut raw = String::new();
+                                        loop {
+                                            match std::io::Read::read(&mut reader, &mut buf) {
+                                                Ok(0) | Err(_) => {
+                                                    let _ = msg.blocking_send(IoMsg::TermStopped);
+                                                    wake();
+                                                    break;
+                                                }
+                                                Ok(n) => {
+                                                    raw.push_str(&String::from_utf8_lossy(
+                                                        &buf[..n],
+                                                    ));
+                                                    if raw.len() > 16_000 {
+                                                        raw.drain(..raw.len() - 8_000);
+                                                    }
+                                                    let rows = pen_term::screen_rows(&raw, 80);
+                                                    let tail = rows
+                                                        .into_iter()
+                                                        .rev()
+                                                        .take(24)
+                                                        .collect::<Vec<_>>();
+                                                    let rows = tail.into_iter().rev().collect();
+                                                    let _ =
+                                                        msg.blocking_send(IoMsg::TermRows(rows));
+                                                    wake();
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+                        IoCmd::TermBytes(bytes) => {
+                            if let Some(writer) = term_writer.as_mut() {
+                                let _ = writer.write_all(&bytes);
+                                let _ = writer.flush();
+                            }
+                            continue;
+                        }
+                        IoCmd::CloneRepo { parent, url } => {
+                            let note = match pen::complete::clone_name(&url) {
+                                None => "Path is outside the folder.".into(),
+                                Some(name) => {
+                                    let dest = parent.join(&name);
+                                    if !dest.starts_with(&parent) {
+                                        "Path is outside the folder.".into()
+                                    } else {
+                                        match pen_git::cli::GitCli::installed() {
+                                            None => "Git is not installed.".into(),
+                                            Some(cli) => match cli.run_with_timeout(
+                                                &parent,
+                                                &["clone", &url, &name],
+                                                std::time::Duration::from_secs(600),
+                                            ) {
+                                                Ok(_) => {
+                                                    let _ = msg_tx
+                                                        .send(IoMsg::ProjectCreated(dest))
+                                                        .await;
+                                                    waker();
+                                                    continue;
+                                                }
+                                                Err(err) => err.to_string(),
+                                            },
+                                        }
+                                    }
+                                }
+                            };
+                            let _ = msg_tx.send(IoMsg::StatusNote(note)).await;
+                            waker();
+                            continue;
+                        }
                     };
                     let _ = &active_watcher;
                     if msg_tx.send(reply).await.is_err() {
@@ -1219,6 +1358,22 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 });
                 tx.instant();
             }
+            IoMsg::TermRows(rows) => {
+                s.term_rows = rows;
+                s.term_missing = false;
+                tx.instant();
+            }
+            IoMsg::TermMissing => {
+                s.term_missing = true;
+                tx.instant();
+            }
+            IoMsg::TermStopped => {
+                if !s.term_stopped {
+                    s.term_stopped = true;
+                    s.term_rows.push("Shell stopped.".into());
+                }
+                tx.instant();
+            }
         }
     }
     let _ = take_lsp(s, tx);
@@ -1258,9 +1413,55 @@ fn take_lsp(s: &mut Pen, tx: &mut Tx) -> bool {
                 }
                 tx.instant();
             }
+            LspEvent::Completion { generation, label } => {
+                let Some(pending) = s.pending_complete.take() else {
+                    continue;
+                };
+                if pending.generation != generation {
+                    continue;
+                }
+                let word = label.or(pending.fallback);
+                if let Some(word) = word
+                    && let OpenPage::Editor(ed) = &mut s.page
+                {
+                    let start = ed.caret.saturating_sub(pending.prefix_len);
+                    replace_prefix(ed, start, &word);
+                    s.note_edit();
+                }
+                tx.instant();
+            }
         }
     }
     true
+}
+
+fn word_before(ed: &EditorState) -> (usize, String) {
+    let caret = ed.caret.min(ed.buffer.len_chars());
+    let line = ed.buffer.char_to_line(caret);
+    let line_start = ed.buffer.line_to_char(line);
+    let col = caret - line_start;
+    let chars: Vec<char> = ed.buffer.line(line).chars().collect();
+    let mut i = col.min(chars.len());
+    while i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_') {
+        i -= 1;
+    }
+    (
+        line_start + i,
+        chars[i..col.min(chars.len())].iter().collect(),
+    )
+}
+
+fn replace_prefix(ed: &mut EditorState, start: usize, word: &str) {
+    let end = ed.caret.min(ed.buffer.len_chars());
+    if start < end {
+        ed.buffer.delete(start..end);
+    }
+    if !word.is_empty() {
+        ed.buffer.insert(start, word);
+    }
+    ed.caret = start + word.chars().count();
+    ed.anchor = ed.caret;
+    ed.reveal_caret();
 }
 
 fn caret_diag(s: &Pen) -> Option<String> {
@@ -1825,6 +2026,97 @@ impl Pen {
         tx.instant();
     }
 
+    fn toggle_terminal(&mut self, tx: &mut Tx) {
+        self.term_open = !self.term_open;
+        self.term_focused = self.term_open;
+        if self.term_open
+            && !self.term_stopped
+            && !self.term_missing
+            && let Some(project) = &self.project
+            && let Some(io_tx) = &self.io_tx
+        {
+            let _ = io_tx.try_send(IoCmd::StartTerm {
+                root: project.root.clone(),
+            });
+        }
+        if let OpenPage::Editor(ed) = &mut self.page {
+            ed.focused = !self.term_focused;
+        }
+        tx.instant();
+    }
+
+    fn toggle_term_side(&mut self, tx: &mut Tx) {
+        self.term_side = !self.term_side;
+        if self.term_side {
+            self.agent_pane.set_open(true);
+        }
+        tx.instant();
+    }
+
+    fn submit_clone(&mut self, tx: &mut Tx) {
+        let url = self.clone_url.text.trim().to_owned();
+        if url.is_empty() {
+            return;
+        }
+        self.clone_open = false;
+        tx.open_folder(
+            FileDialogOptions {
+                title: "Clone into".into(),
+                directory: self.project.as_ref().map(|p| p.root.clone()),
+                file_name: None,
+                filters: Vec::new(),
+            },
+            move |s: &mut Pen, result, tx: &mut Tx| {
+                if let Ok(Some(parent)) = result
+                    && let Some(io_tx) = &s.io_tx
+                {
+                    let _ = io_tx.try_send(IoCmd::CloneRepo { parent, url });
+                }
+                tx.instant();
+            },
+        );
+    }
+
+    fn request_completion(&mut self) {
+        let OpenPage::Editor(ed) = &mut self.page else {
+            return;
+        };
+        let (start, prefix) = word_before(ed);
+        if prefix.is_empty() {
+            return;
+        }
+        let text = ed.buffer.text();
+        let fallback = pen::complete::buffer_word(&text, &prefix);
+        self.complete_gen += 1;
+        let generation = self.complete_gen;
+        let prefix_len = prefix.chars().count();
+        let Some(rel) = self.active_path.clone() else {
+            if let Some(word) = fallback
+                && let OpenPage::Editor(ed) = &mut self.page
+            {
+                replace_prefix(ed, start, &word);
+            }
+            return;
+        };
+        let line = ed.buffer.char_to_line(ed.caret) as u32;
+        let character = (ed.caret - ed.buffer.line_to_char(line as usize)) as u32;
+        self.pending_complete = Some(PendingComplete {
+            generation,
+            prefix_len,
+            fallback,
+        });
+        if let Some(lsp_tx) = &self.lsp_tx {
+            let _ = lsp_tx.try_send(LspCmd::Complete {
+                rel,
+                line,
+                character,
+                generation,
+            });
+        }
+        let _ = start;
+        let _ = prefix_len;
+    }
+
     fn toggle_agent(&mut self, tx: &mut Tx) {
         self.agent_pane.toggle();
         if self.agent_pane.is_open() {
@@ -1913,6 +2205,12 @@ impl Pen {
             "Find" => self.open_find(tx),
             "Go to definition" => self.go_to_definition(tx),
             "OpenCode" => self.toggle_agent(tx),
+            "Terminal" => self.toggle_terminal(tx),
+            "Clone repository" => {
+                self.clone_open = true;
+                self.clone_url.focused = true;
+                tx.instant();
+            }
             "Zoom in" => self.apply_page_chord(Chord::ZoomIn, tx),
             "Zoom out" => self.apply_page_chord(Chord::ZoomOut, tx),
             "Reset zoom" => self.apply_page_chord(Chord::ZoomReset, tx),
@@ -2030,9 +2328,7 @@ fn build_file_tree(entries: Vec<FileEntry>) -> TreeModel<FileNode<PathBuf>> {
         let slash = path_to_slash(&e.rel);
         (slash, e.rel)
     });
-    let mut tree = FileTree::new().key("pen/tree").build(pairs);
-    tree.expand_all();
-    tree
+    FileTree::new().key("pen/tree").build(pairs)
 }
 
 fn path_to_slash(p: &std::path::Path) -> String {
@@ -2238,6 +2534,93 @@ fn agent_pane(s: &Pen, theme: &Theme) -> El {
     pen::agent::agent_column(&s.agent_lines.lines, s.agent_missing, theme, input)
 }
 
+fn term_panel(s: &Pen, theme: &Theme) -> El {
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let bg = rgb_color(theme.bg);
+    let rule = fg.alpha(0.20);
+    let code = TextStyle {
+        size: CODE_SIZE,
+        weight: 400.0,
+        family: Family::Mono,
+        line_height: LINE_H,
+        tracking: 0.0,
+        variations: "",
+        features: "",
+        optical_size: OpticalSize::Auto,
+        italic: false,
+    };
+    let mut body = col()
+        .key("pen/term")
+        .w_full()
+        .fill(bg)
+        .padding(12.0)
+        .gap(4.0)
+        .border_sides([1.0, 0.0, 0.0, 0.0], rule)
+        .transition(Transition::none())
+        .on_press_tx(|s: &mut Pen, tx: &mut Tx| {
+            s.term_focused = true;
+            if let OpenPage::Editor(ed) = &mut s.page {
+                ed.focused = false;
+            }
+            tx.instant();
+        });
+    if s.term_side {
+        body = body.grow(1.0).min_h(0.0);
+    } else {
+        body = body.h(220.0);
+    }
+    body = body.child(
+        row()
+            .w_full()
+            .h(24.0)
+            .center_y()
+            .child(text("Terminal").font(UI_MEDIUM_FONT).color(fg))
+            .child(
+                text(if s.term_side { "Bottom" } else { "Side" })
+                    .font(UI_FONT)
+                    .color(faint)
+                    .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.toggle_term_side(tx)),
+            ),
+    );
+    if s.term_missing {
+        return body.child(text("No shell found.").font(UI_FONT).color(faint));
+    }
+    for (i, line) in s.term_rows.iter().enumerate() {
+        body = body.child(
+            text(line.clone())
+                .key(format!("pen/term-row-{i}"))
+                .font(code)
+                .color(fg)
+                .transition(Transition::none()),
+        );
+    }
+    body
+}
+
+fn clone_bar(s: &Pen, theme: &Theme) -> El {
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    row()
+        .key("pen/clone")
+        .w_full()
+        .h(36.0)
+        .px(16.0)
+        .center_y()
+        .child(
+            text_input(&s.clone_url, UI_FONT)
+                .key("pen/clone-url")
+                .label("Repository URL")
+                .single_line()
+                .placeholder("Repository URL", faint)
+                .color(fg)
+                .w_full()
+                .h(28.0)
+                .on_edit(|s: &mut Pen| &mut s.clone_url)
+                .on_submit(|s: &mut Pen, tx: &mut Tx| s.submit_clone(tx)),
+        )
+}
+
 fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     let theme = s.theme_pref.resolve(cx.system_dark());
     let bg = rgb_color(theme.bg);
@@ -2354,7 +2737,13 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
             },
         ));
     }
+    if s.clone_open {
+        page_stack = page_stack.child(clone_bar(s, &theme));
+    }
     page_stack = page_stack.child(main_surface);
+    if s.term_open && !s.term_side {
+        page_stack = page_stack.child(term_panel(s, &theme));
+    }
     let diag_note = caret_diag(s);
     let shown = s.status.clone().or(diag_note);
     if let Some(status) = shown {
@@ -2396,8 +2785,8 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                     .entries
                     .iter()
                     .filter_map(|e| {
-                        let lbl = status_label(e);
-                        (!lbl.is_empty()).then(|| (e.rel.clone(), lbl))
+                        pen::tree_state::letter_for(e.tracked, e.added, e.removed)
+                            .map(|letter| (e.rel.clone(), letter.to_string()))
                     })
                     .collect(),
             );
@@ -2540,7 +2929,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
             .gap(4.0)
             .center_y()
             .border_sides([0.0, 0.0, 1.0, 0.0], rule);
-        for dock in dock::visible_docks(true) {
+        for dock in dock::visible_docks(true, true) {
             tabs = match dock {
                 DockId::Files => tabs.child(tab(
                     "pen/tab-files",
@@ -2549,17 +2938,40 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                     SidebarMode::Files,
                 )),
                 DockId::Git => tabs.child(tab("pen/tab-git", "Git", git_active, SidebarMode::Git)),
-                DockId::Terminal => tabs,
+                DockId::Terminal => tabs.child(
+                    row()
+                        .key("pen/tab-term")
+                        .role("tab")
+                        .label("Terminal")
+                        .focusable(true)
+                        .h(26.0)
+                        .px(8.0)
+                        .radius(6.0)
+                        .center_y()
+                        .cursor(Cursor::Pointer)
+                        .fill(if s.term_open { fg.alpha(0.08) } else { bg })
+                        .transition(Transition::none())
+                        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.toggle_terminal(tx))
+                        .child(
+                            text("Terminal")
+                                .font(if s.term_open { UI_MEDIUM_FONT } else { UI_FONT })
+                                .color(if s.term_open { fg } else { faint }),
+                        ),
+                ),
             };
         }
         sidebar = sidebar.child(tabs);
     }
     sidebar = sidebar.child(sidebar_body);
 
-    let agent = agent_pane(s, &theme);
+    let inspector = if s.term_open && s.term_side {
+        term_panel(s, &theme)
+    } else {
+        agent_pane(s, &theme)
+    };
     let mut split = SplitView::new(page_stack)
         .sidebar(&s.sidebar, |s: &mut Pen| &mut s.sidebar, sidebar)
-        .inspector(&s.agent_pane, |s: &mut Pen| &mut s.agent_pane, agent)
+        .inspector(&s.agent_pane, |s: &mut Pen| &mut s.agent_pane, inspector)
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
         .pane_motion(PaneMotion::new().spring(Spring::new(0.35, 0.0)))
@@ -2744,6 +3156,9 @@ fn native_file_items(s: &Pen) -> Vec<rune::MenuItem<Pen>> {
                 .id("pen.open"),
             "mod+o",
         ),
+        rune::MenuItem::new("Clone repository", clone_from_menu)
+            .menu("File")
+            .id("pen.clone"),
     ];
     if s.project.is_some() {
         items.push(with_chord(
@@ -2828,6 +3243,14 @@ fn file_menu(s: &Pen, theme: &Theme, k: &rune_kit::Kit, layer: &mut Vec<El>) -> 
             MenuItem::new("New project").on_select_tx(|s: &mut Pen, tx: &mut Tx| {
                 s.file_menu_open = false;
                 s.open_new_project(tx);
+            }),
+        )
+        .item(
+            MenuItem::new("Clone repository").on_select_tx(|s: &mut Pen, tx: &mut Tx| {
+                s.file_menu_open = false;
+                s.clone_open = true;
+                s.clone_url.focused = true;
+                tx.instant();
             }),
         )
         .item(
@@ -3425,6 +3848,31 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.toggle_palette(tx);
         return true;
     }
+    if is_term_toggle(ev) && s.project.is_some() {
+        s.toggle_terminal(tx);
+        return true;
+    }
+    if s.term_focused && s.term_open {
+        if ev.key == Key::Escape {
+            s.term_focused = false;
+            if let OpenPage::Editor(ed) = &mut s.page {
+                ed.focused = true;
+            }
+            tx.instant();
+            return true;
+        }
+        if let Some(bytes) = term_bytes(ev)
+            && let Some(io_tx) = &s.io_tx
+        {
+            let _ = io_tx.try_send(IoCmd::TermBytes(bytes));
+            return true;
+        }
+    }
+    if ev.key == Key::Tab && !s.term_focused && !s.palette_open && !s.find_open {
+        s.request_completion();
+        tx.instant();
+        return true;
+    }
     if let Some(chord) = keys::chord(ev) {
         match chord {
             Chord::Palette => {
@@ -3726,6 +4174,45 @@ diff --git a/crates/app/src/editor.rs b/crates/app/src/editor.rs
     };
 }
 
+fn clone_from_menu(s: &mut Pen, tx: &mut Tx) {
+    s.clone_open = true;
+    s.clone_url.focused = true;
+    tx.instant();
+}
+
+fn zoom_in_menu(s: &mut Pen, tx: &mut Tx) {
+    s.apply_page_chord(Chord::ZoomIn, tx);
+}
+
+fn zoom_out_menu(s: &mut Pen, tx: &mut Tx) {
+    s.apply_page_chord(Chord::ZoomOut, tx);
+}
+
+fn zoom_reset_menu(s: &mut Pen, tx: &mut Tx) {
+    s.apply_page_chord(Chord::ZoomReset, tx);
+}
+
+fn is_term_toggle(ev: &KeyEvent) -> bool {
+    if ev.mods.alt || ev.mods.shift {
+        return false;
+    }
+    ev.is_command('`') || (ev.mods.ctrl && matches!(&ev.key, Key::Text(t) if t == "`"))
+}
+
+fn term_bytes(ev: &KeyEvent) -> Option<Vec<u8>> {
+    match &ev.key {
+        Key::Text(t) if !ev.mods.cmd && !ev.mods.ctrl => Some(t.as_bytes().to_vec()),
+        Key::Enter => Some(b"\r".to_vec()),
+        Key::Backspace => Some(vec![0x7f]),
+        Key::Tab => Some(b"\t".to_vec()),
+        Key::Up => Some(b"\x1b[A".to_vec()),
+        Key::Down => Some(b"\x1b[B".to_vec()),
+        Key::Right => Some(b"\x1b[C".to_vec()),
+        Key::Left => Some(b"\x1b[D".to_vec()),
+        _ => None,
+    }
+}
+
 fn main() {
     rune::prewarm_gpu();
     if let Err(e) = rune::set_app_icon(include_bytes!("../assets/icon.png").as_slice()) {
@@ -3749,7 +4236,19 @@ fn main() {
     let app = rune::App::new(spec)
         .chrome(chrome)
         .on_ime(on_ime)
-        .standard_menus();
+        .standard_menus()
+        .menu_item(with_chord(
+            rune::MenuItem::new("Zoom in", zoom_in_menu).menu("Window"),
+            "mod+=",
+        ))
+        .menu_item(with_chord(
+            rune::MenuItem::new("Zoom out", zoom_out_menu).menu("Window"),
+            "mod+-",
+        ))
+        .menu_item(with_chord(
+            rune::MenuItem::new("Reset zoom", zoom_reset_menu).menu("Window"),
+            "mod+0",
+        ));
     let _ = FILE_MENU.set(app.handle());
     app.run();
 }

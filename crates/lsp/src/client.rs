@@ -147,6 +147,22 @@ impl Client {
         Ok(locations(&result))
     }
 
+    pub fn completion(
+        &mut self,
+        rel: &Path,
+        line: u32,
+        character: u32,
+    ) -> Result<serde_json::Value, LspError> {
+        let uri = document_uri(&self.root, rel)?;
+        self.request(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+            }),
+        )
+    }
+
     /// Diagnostics published since the last drain. A file with an empty vec was cleared.
     pub fn drain_diagnostics(&mut self) -> Vec<(PathBuf, Vec<Published>)> {
         self.pump();

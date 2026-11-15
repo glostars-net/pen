@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod agent_write;
+pub mod complete;
 pub mod diagnostics;
 pub mod disk;
 pub mod dock;
@@ -18,6 +19,7 @@ pub mod recents;
 pub mod scaffold;
 pub mod settings;
 pub mod theme_kit;
+pub mod tree_state;
 
 /// Bundled OFL faces (IBM Plex Sans for chrome, IBM Plex Mono for code).
 /// No third family, no script face.

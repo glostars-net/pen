@@ -157,6 +157,10 @@ Gate verified on `rustc 1.99.1` against pinned Rune rev
   - **Monochrome ink-step diff:** confirmed (`theme.added` and `theme.removed` derive from contrast-checked `>= 4.5:1` OKLab ink steps mapped onto `rune_kit::DiffView`, paired with a five-step monochrome `diff_highlighter`; zero green/red diff bars or rainbow syntax).
   - **Tree & Changes status labels:** confirmed (`+n −n` using true minus `U+2212` for tracked modifications and `new` for untracked files in `theme.faint` tabular numerals; no colored status dot).
 
+## Phase 7
+
+The terminal is one panel, bottom by default, or on the side. It starts `$SHELL` in the open folder and does not restart after it exits. If no shell is on `PATH`, the panel says "No shell found." Folders in the tree start collapsed. A changed file shows `A`, `M`, `D`, or `U` in ink. Tab asks the language server, then a word already in the buffer. Clone uses system `git` into a folder you pick. A failed clone is not opened. Edit and Window stay the platform menus. Zoom is also under Window.
+
 ## Phase 6
 
 The writing page zooms from 9 pt to 28 pt (`⌘=` / `⌘-` / `⌘0`). Chrome stays at 13 pt. Syntax stays the five-step ink ramp; a `theme.json` `syntax` list is still the only way to add hue, and a step under 4.5:1 is still dropped. The extra chords match Visual Studio Code: comment, delete line, move line, indent, and `⌘⇧P` for the palette. Zoom is not saved.

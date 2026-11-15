@@ -1,5 +1,5 @@
 //! Allow-listed wrapper over the system `git` binary (`fetch`, `push`,
-//! `merge` only; never `--force`, `--hard`, `rebase`, `+refspec`, or option
+//! `merge`, `clone`; never `--force`, `--hard`, `rebase`, `+refspec`, or option
 //! flags).
 
 use std::path::Path;
@@ -39,7 +39,7 @@ impl GitCli {
         let Some((&subcmd, rest)) = args.split_first() else {
             return Err(GitError::NotAllowed);
         };
-        if !matches!(subcmd, "fetch" | "push" | "merge") {
+        if !matches!(subcmd, "fetch" | "push" | "merge" | "clone") {
             return Err(GitError::NotAllowed);
         }
         if rest
