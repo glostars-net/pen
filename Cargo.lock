@@ -3957,6 +3957,7 @@ dependencies = [
  "pen-git",
  "pen-lsp",
  "pen-plugins",
+ "pen-term",
  "project",
  "rune",
  "rune-kit",
@@ -3997,6 +3998,13 @@ dependencies = [
  "highlight",
  "thiserror 2.0.21",
  "wasmtime",
+]
+
+[[package]]
+name = "pen-term"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
