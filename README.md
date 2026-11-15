@@ -157,6 +157,10 @@ Gate verified on `rustc 1.99.1` against pinned Rune rev
   - **Monochrome ink-step diff:** confirmed (`theme.added` and `theme.removed` derive from contrast-checked `>= 4.5:1` OKLab ink steps mapped onto `rune_kit::DiffView`, paired with a five-step monochrome `diff_highlighter`; zero green/red diff bars or rainbow syntax).
   - **Tree & Changes status labels:** confirmed (`+n −n` using true minus `U+2212` for tracked modifications and `new` for untracked files in `theme.faint` tabular numerals; no colored status dot).
 
+## Phase 8
+
+Fifty palettes are generated. Ink and Paper stay first, and they keep the ink ramp. Every other palette may use hue, and a step under 4.5:1 is dropped. A missing palette name falls back to Ink. `Use Ink` still saves. Settings can set the scale from 90 to 140, which multiplies the writing-page size on top of zoom. A GitHub token can be stored in the config directory. It is not sent. There is no OAuth and no account. The first launch shows three lines, once. Grain is static and only on settings.
+
 ## Phase 7
 
 The terminal is one panel, bottom by default, or on the side. It starts `$SHELL` in the open folder and does not restart after it exits. If no shell is on `PATH`, the panel says "No shell found." Folders in the tree start collapsed. A changed file shows `A`, `M`, `D`, or `U` in ink. Tab asks the language server, then a word already in the buffer. Clone uses system `git` into a folder you pick. A failed clone is not opened. Edit and Window stay the platform menus. Zoom is also under Window.

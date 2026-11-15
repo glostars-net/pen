@@ -37,8 +37,8 @@ use project::{FileEntry, Project, ReadFile};
 use rune::dirs::AppDirs;
 use rune::{
     AppSpec, Chrome, Cursor, Cx, Drag, El, Family, FileDialogOptions, Ime, Key, KeyEvent,
-    OpticalSize, Spring, TextEdit, TextStyle, Transition, Tx, Waker, WheelEvent, col, el, row,
-    text, text_input,
+    OpticalSize, Spring, TextEdit, TextStyle, Transition, Tx, Waker, WheelEvent, col, el, icon,
+    row, text, text_input,
 };
 use rune_kit::diff::{DiffMode, DiffState, parse as parse_diff};
 use rune_kit::shell::{self, PaneMotion, PaneState, SplitView, Toolbar};
@@ -85,6 +85,7 @@ enum ThemePref {
     Ink,
     Paper,
     Custom(Box<Theme>),
+    Named(String),
 }
 
 impl ThemePref {
@@ -100,6 +101,7 @@ impl ThemePref {
             ThemePref::Ink => highlight::ink(),
             ThemePref::Paper => highlight::paper(),
             ThemePref::Custom(t) => (**t).clone(),
+            ThemePref::Named(name) => highlight::theme_named(name),
         }
     }
 }
@@ -121,10 +123,11 @@ enum IoCmd {
         rel: PathBuf,
         bytes: Vec<u8>,
     },
-    SaveThemePref(&'static str),
+    SaveThemePref(String),
     SaveThemeJson(String),
     SaveRecents(Vec<Recent>),
     SaveName(String),
+    SaveToken(Option<String>),
     CreateProject {
         parent: PathBuf,
         name: String,
@@ -333,6 +336,9 @@ struct Pen {
     clone_url: TextEdit,
     complete_gen: u64,
     pending_complete: Option<PendingComplete>,
+    ui_scale: i32,
+    sheet_open: bool,
+    token_edit: TextEdit,
 }
 
 struct PendingComplete {
@@ -419,6 +425,9 @@ fn init() -> Pen {
         clone_url: TextEdit::new(""),
         complete_gen: 0,
         pending_complete: None,
+        ui_scale: 100,
+        sheet_open: false,
+        token_edit: TextEdit::new(""),
     }
 }
 
@@ -615,7 +624,7 @@ fn setup(s: &mut Pen, waker: Waker) {
                         }
                         IoCmd::SaveThemePref(choice) => {
                             let _ = tokio::task::spawn_blocking(move || {
-                                write_theme_pref_blocking(choice)
+                                write_theme_pref_blocking(&choice)
                             })
                             .await;
                             continue;
@@ -636,6 +645,12 @@ fn setup(s: &mut Pen, waker: Waker) {
                         IoCmd::SaveName(name) => {
                             let _ = tokio::task::spawn_blocking(move || write_name_blocking(&name))
                                 .await;
+                            continue;
+                        }
+                        IoCmd::SaveToken(token) => {
+                            let _ =
+                                tokio::task::spawn_blocking(move || write_token_blocking(token))
+                                    .await;
                             continue;
                         }
                         IoCmd::CreateProject { parent, name, kind } => {
@@ -1143,6 +1158,7 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                     s.status = plugin_note;
                 }
                 if first_launch && s.project.is_none() {
+                    s.sheet_open = true;
                     s.page_opacity = 0.0;
                     s.reveal_first_launch = true;
                     tx.instant();
@@ -1205,6 +1221,7 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                         let mut buf = Buffer::from_str(&src);
                         buf.mark_saved();
                         let mut ed = EditorState::from_buffer(buf).with_language(lang);
+                        ed.ui_scale = s.ui_scale;
                         s.open_diags = s.diags.for_file(&rel);
                         ed.focused =
                             !s.palette_open && !s.find_open && !s.git_panel.has_active_input();
@@ -1835,6 +1852,22 @@ impl Pen {
         tx.instant();
     }
 
+    fn set_palette(&mut self, name: String, tx: &mut Tx) {
+        self.theme_pref = ThemePref::Named(name.clone());
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::SaveThemePref(name));
+        }
+        tx.instant();
+    }
+
+    fn set_scale(&mut self, scale: i32, tx: &mut Tx) {
+        self.ui_scale = pen::settings::clamp_scale(scale);
+        if let OpenPage::Editor(ed) = &mut self.page {
+            ed.ui_scale = self.ui_scale;
+        }
+        tx.instant();
+    }
+
     fn set_appearance(&mut self, choice: &'static str, tx: &mut Tx) {
         self.theme_pref = match choice {
             "ink" => ThemePref::Ink,
@@ -1842,7 +1875,16 @@ impl Pen {
             _ => ThemePref::System,
         };
         if let Some(io_tx) = &self.io_tx {
-            let _ = io_tx.try_send(IoCmd::SaveThemePref(choice));
+            let _ = io_tx.try_send(IoCmd::SaveThemePref(choice.to_owned()));
+        }
+        tx.instant();
+    }
+
+    fn save_token(&mut self, tx: &mut Tx) {
+        let token = pen::settings::parse_token(&self.token_edit.text);
+        self.token_edit = TextEdit::new(token.as_deref().unwrap_or(""));
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::SaveToken(token));
         }
         tx.instant();
     }
@@ -2282,7 +2324,7 @@ impl Pen {
                 self.diff_theme_bg = ink.bg;
                 self.diff_state.set_highlighter(diff_highlighter(&ink));
                 if let Some(io_tx) = &self.io_tx {
-                    let _ = io_tx.try_send(IoCmd::SaveThemePref("ink"));
+                    let _ = io_tx.try_send(IoCmd::SaveThemePref("ink".into()));
                 }
                 tx.instant();
             }
@@ -2292,7 +2334,7 @@ impl Pen {
                 self.diff_theme_bg = paper.bg;
                 self.diff_state.set_highlighter(diff_highlighter(&paper));
                 if let Some(io_tx) = &self.io_tx {
-                    let _ = io_tx.try_send(IoCmd::SaveThemePref("paper"));
+                    let _ = io_tx.try_send(IoCmd::SaveThemePref("paper".into()));
                 }
                 tx.instant();
             }
@@ -2446,7 +2488,8 @@ fn read_startup_prefs_blocking() -> StartupPrefs {
     {
         Some("ink") => ThemePref::Ink,
         Some("paper") => ThemePref::Paper,
-        _ => ThemePref::System,
+        Some("system") | None => ThemePref::System,
+        Some(name) => ThemePref::Named(name.to_owned()),
     };
     StartupPrefs {
         theme_pref,
@@ -2467,6 +2510,23 @@ fn write_recents_blocking(list: &[Recent]) {
     let cfg = dirs.config();
     if std::fs::create_dir_all(cfg).is_ok() {
         let _ = std::fs::write(cfg.join("recents.json"), to_json(list));
+    }
+}
+
+fn write_token_blocking(token: Option<String>) {
+    let Some(dirs) = AppDirs::new("pen") else {
+        return;
+    };
+    let path = dirs.config().join("github-token");
+    match token {
+        Some(token) => {
+            if std::fs::create_dir_all(dirs.config()).is_ok() {
+                let _ = std::fs::write(path, token);
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -2532,6 +2592,34 @@ fn agent_pane(s: &Pen, theme: &Theme) -> El {
         )
     };
     pen::agent::agent_column(&s.agent_lines.lines, s.agent_missing, theme, input)
+}
+
+fn first_sheet(theme: &Theme) -> El {
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    col()
+        .key("pen/sheet")
+        .w_full()
+        .padding(16.0)
+        .gap(6.0)
+        .fill(rgb_color(theme.bg))
+        .border_sides([0.0, 0.0, 1.0, 0.0], fg.alpha(0.20))
+        .child(text("Open a folder.").font(UI_FONT).color(fg))
+        .child(
+            text("The terminal starts in that folder.")
+                .font(UI_FONT)
+                .color(faint),
+        )
+        .child(text("⌘K opens the palette.").font(UI_FONT).color(faint))
+        .child(
+            text("Dismiss")
+                .font(UI_FONT)
+                .color(fg)
+                .on_press_tx(|s: &mut Pen, tx: &mut Tx| {
+                    s.sheet_open = false;
+                    tx.instant();
+                }),
+        )
 }
 
 fn term_panel(s: &Pen, theme: &Theme) -> El {
@@ -2737,6 +2825,9 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
             },
         ));
     }
+    if s.sheet_open {
+        page_stack = page_stack.child(first_sheet(&theme));
+    }
     if s.clone_open {
         page_stack = page_stack.child(clone_bar(s, &theme));
     }
@@ -2909,8 +3000,12 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                 .center_y()
                 .cursor(Cursor::Pointer)
                 .fill(if active { fg.alpha(0.08) } else { bg })
-                .hover(fg.alpha(0.06))
-                .transition(Transition::none())
+                .hover(fg.alpha(0.08))
+                .transition(if cx.is_reduced_motion() {
+                    Transition::none()
+                } else {
+                    Transition::opacity()
+                })
                 .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
                     s.git_panel.mode = target;
                     tx.instant();
@@ -3359,6 +3454,16 @@ fn back_button(key: &'static str, theme: &Theme) -> El {
         .child(text("Back").font(UI_FONT).color(fg))
 }
 
+fn kind_mark(id: &str) -> pen::file_mark::FileMark {
+    match id {
+        "rust-bin" | "rust-lib" => pen::file_mark::FileMark::Rust,
+        "notes" => pen::file_mark::FileMark::Markdown,
+        "node" => pen::file_mark::FileMark::Javascript,
+        "python" => pen::file_mark::FileMark::Python,
+        _ => pen::file_mark::FileMark::Folder,
+    }
+}
+
 fn choice_button(key: String, label: &'static str, on: bool, theme: &Theme) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
@@ -3382,6 +3487,46 @@ fn choice_button(key: String, label: &'static str, on: bool, theme: &Theme) -> E
         .press(fg.alpha(0.12))
         .transition(Transition::none())
         .child(text(label).font(UI_MEDIUM_FONT).color(fg))
+}
+
+fn palette_list(s: &Pen, theme: &Theme) -> El {
+    let fg = rgb_color(theme.fg);
+    let bg = rgb_color(theme.bg);
+    let mut list = col().key("pen/palette-list").gap(4.0);
+    for item in highlight::catalog().into_iter().skip(2) {
+        let name = item.name;
+        let on = matches!(&s.theme_pref, ThemePref::Named(current) if current == &name);
+        let pick = name.clone();
+        list = list.child(
+            row()
+                .key(format!("pen/pal-{name}"))
+                .role("button")
+                .label(name.clone())
+                .h(28.0)
+                .px(8.0)
+                .center_y()
+                .cursor(Cursor::Pointer)
+                .fill(if on { fg.alpha(0.08) } else { bg })
+                .hover(fg.alpha(0.08))
+                .transition(Transition::opacity())
+                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| s.set_palette(pick.clone(), tx))
+                .child(text(name).font(UI_FONT).color(fg)),
+        );
+    }
+    list
+}
+
+fn grain(theme: &Theme) -> El {
+    let ink = rgb_color(theme.fg).alpha(0.08);
+    let mut layer = el().key("pen/grain").w(280.0).h(12.0);
+    for i in 0..16 {
+        layer = layer.child(
+            el().absolute((i * 17) as f32, (i % 3) as f32)
+                .size(1.0, 1.0)
+                .fill(ink),
+        );
+    }
+    layer
 }
 
 fn settings_page(s: &Pen, theme: &Theme, reduced: bool) -> El {
@@ -3440,6 +3585,41 @@ fn settings_page(s: &Pen, theme: &Theme, reduced: bool) -> El {
                     .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("paper", tx)),
                 ),
         )
+        .child(text("Type").font(UI_FONT).color(faint))
+        .child(
+            row()
+                .gap(8.0)
+                .child(
+                    choice_button("pen/scale-100".into(), "100", s.ui_scale == 100, theme)
+                        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_scale(100, tx)),
+                )
+                .child(
+                    choice_button("pen/scale-120".into(), "120", s.ui_scale == 120, theme)
+                        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_scale(120, tx)),
+                )
+                .child(
+                    choice_button("pen/scale-90".into(), "90", s.ui_scale == 90, theme)
+                        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_scale(90, tx)),
+                ),
+        )
+        .child(text("Palettes").font(UI_FONT).color(faint))
+        .child(palette_list(s, theme))
+        .child(
+            text("GitHub token, stored only on this Mac")
+                .font(UI_FONT)
+                .color(faint),
+        )
+        .child(
+            text_input(&s.token_edit, UI_FONT)
+                .key("pen/token")
+                .single_line()
+                .w(280.0)
+                .h(36.0)
+                .color(fg)
+                .on_edit(|s: &mut Pen| &mut s.token_edit)
+                .on_submit(|s: &mut Pen, tx: &mut Tx| s.save_token(tx)),
+        )
+        .child(grain(theme))
         .child(text("Name").font(UI_FONT).color(faint))
         .child(
             text_input(&s.name_edit, UI_FONT)
@@ -3463,13 +3643,14 @@ fn new_project_page(s: &Pen, theme: &Theme, reduced: bool) -> El {
     let mut row_el = row().gap(8.0);
     for (i, kind) in rows.iter().enumerate() {
         let on = s.project_kind == i;
+        let mark = kind_mark(kind.id);
         row_el = row_el.child(
-            choice_button(format!("pen/kind-{}", kind.id), kind.label, on, theme).on_press_tx(
-                move |s: &mut Pen, tx: &mut Tx| {
+            choice_button(format!("pen/kind-{}", kind.id), kind.label, on, theme)
+                .child(icon(mark_icon(mark), 16.0).color(fg))
+                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
                     s.project_kind = i;
                     tx.instant();
-                },
-            ),
+                }),
         );
         if i % 2 == 1 || i + 1 == rows.len() {
             kinds = kinds.child(row_el);
@@ -3747,7 +3928,7 @@ fn palette_overlay(s: &Pen, theme: &Theme) -> El {
             .cursor(Cursor::Pointer)
             .fill(if active { fg.alpha(0.10) } else { bg })
             .hover(fg.alpha(0.08))
-            .transition(Transition::none())
+            .transition(Transition::opacity())
             .on_press_tx(move |s: &mut Pen, tx: &mut Tx| s.run_command(&cmd_owned, tx))
             .child(
                 text(cmd.clone())

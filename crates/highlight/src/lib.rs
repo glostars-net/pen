@@ -188,6 +188,86 @@ pub fn load_theme(json: &str) -> Result<Theme, ThemeError> {
 
 /// Highlight only the visible viewport lines through `rune_kit::syntax::highlight`
 /// and map token kinds onto `theme.syntax`. Returns per-line `(byte_range, Rgb)`.
+/// Fifty palettes. Ink and Paper stay first. A step under 4.5:1 is not shipped.
+pub fn catalog() -> Vec<Theme> {
+    let mut themes = vec![ink(), paper()];
+    let seeds = [
+        0.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0, 210.0, 240.0, 270.0, 300.0, 330.0,
+    ];
+    let relations = ["analogous", "complementary", "split", "triadic"];
+    for (i, hue) in seeds.iter().enumerate() {
+        for (j, relation) in relations.iter().enumerate() {
+            themes.push(generated_theme(*hue, relation, i + j));
+        }
+    }
+    themes
+}
+
+pub fn theme_named(name: &str) -> Theme {
+    catalog()
+        .into_iter()
+        .find(|theme| theme.name == name)
+        .unwrap_or_else(ink)
+}
+
+fn generated_theme(hue: f32, relation: &str, salt: usize) -> Theme {
+    let dark = salt.is_multiple_of(2);
+    let bg = if dark {
+        hsl(hue, 0.08, 0.12)
+    } else {
+        hsl(hue, 0.06, 0.96)
+    };
+    let fg_seed = if dark {
+        Rgb(0xf4, 0xf1, 0xea)
+    } else {
+        Rgb(0x1a, 0x19, 0x16)
+    };
+    let fg = walk_to_contrast(fg_seed, fg_seed, bg);
+    let offsets = match relation {
+        "complementary" => [0.0, 180.0, 20.0, 160.0, 200.0],
+        "split" => [0.0, 150.0, 210.0, 30.0, 180.0],
+        "triadic" => [0.0, 120.0, 240.0, 40.0, 200.0],
+        _ => [0.0, 24.0, -24.0, 42.0, -42.0],
+    };
+    let syntax = offsets.map(|offset| {
+        let seed = hsl(hue + offset, 0.55, if dark { 0.72 } else { 0.32 });
+        walk_to_contrast(seed, fg, bg)
+    });
+    let faint = walk_to_contrast(mix_oklab(fg, bg, 0.48), fg, bg);
+    let added = walk_to_contrast(mix_oklab(fg, bg, 0.10), fg, bg);
+    let removed = walk_to_contrast(mix_oklab(fg, bg, 0.44), fg, bg);
+    let mix_u8 = |f: u8, b: u8| (0.12 * f32::from(f) + 0.88 * f32::from(b)).round() as u8;
+    Theme {
+        name: format!("{relation} {hue:.0}"),
+        bg,
+        fg,
+        faint,
+        selection: Rgb(mix_u8(fg.0, bg.0), mix_u8(fg.1, bg.1), mix_u8(fg.2, bg.2)),
+        added,
+        removed,
+        syntax,
+        diagnostic: None,
+    }
+}
+
+fn hsl(h: f32, s: f32, l: f32) -> Rgb {
+    let h = h.rem_euclid(360.0);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let ch = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Rgb(ch(r + m), ch(g + m), ch(b + m))
+}
+
 pub fn highlight_lines(
     lang: Option<&str>,
     expanded_lines: &[String],
@@ -377,6 +457,21 @@ mod tests {
             load_theme(r##"{"name":"x","bg":"#ffffff","fg":"#111111","diagnostic":"#111111"}"##)
                 .unwrap();
         assert_eq!(kept.diagnostic, Some(Rgb::from_hex("#111111")));
+    }
+
+    #[test]
+    fn catalog_is_fifty_contrast_checked_palettes() {
+        let themes = catalog();
+        assert_eq!(themes.len(), 50);
+        assert_eq!(themes[0].name, "Ink");
+        assert_eq!(themes[1].name, "Paper");
+        for theme in &themes {
+            assert!(contrast_ratio(theme.fg, theme.bg) >= 4.5, "{}", theme.name);
+            for step in theme.syntax {
+                assert!(contrast_ratio(step, theme.bg) >= 4.5, "{}", theme.name);
+            }
+        }
+        assert_eq!(theme_named("nope").name, "Ink");
     }
 
     #[test]

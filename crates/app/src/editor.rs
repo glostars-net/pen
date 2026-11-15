@@ -96,6 +96,8 @@ pub struct EditorState {
     pub language: Option<String>,
     /// Writing-page size in points. Chrome does not follow this.
     pub code_size: f32,
+    /// Percent applied on top of [`Self::code_size`]. 100 is unchanged.
+    pub ui_scale: i32,
 }
 
 impl EditorState {
@@ -116,15 +118,20 @@ impl EditorState {
             theme: highlight::paper(),
             language: None,
             code_size: CODE_SIZE,
+            ui_scale: 100,
         }
     }
 
+    fn render_size(&self) -> f32 {
+        self.code_size * (self.ui_scale.clamp(90, 140) as f32) / 100.0
+    }
+
     pub fn line_h(&self) -> f32 {
-        line_h_for(self.code_size)
+        line_h_for(self.render_size())
     }
 
     pub fn char_advance(&self) -> f32 {
-        advance_for(self.code_size)
+        advance_for(self.render_size())
     }
 
     /// Clamp to 9–28 pt and keep the same line at the top of the page.
@@ -779,8 +786,8 @@ pub fn editor_view_themed(
     let sel_color = fg.alpha(0.12);
     let line_h = state.line_h();
     let advance = state.char_advance();
-    let code_font = code_font(state.code_size);
-    let line_no_font = line_no_font(state.code_size);
+    let code_font = code_font(state.render_size());
+    let line_no_font = line_no_font(state.render_size());
 
     let first_line = (state.scroll_y / f64::from(line_h)).floor() as usize;
     let sub_y = -((state.scroll_y % f64::from(line_h)) as f32);
