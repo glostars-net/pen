@@ -589,7 +589,7 @@ impl EditorState {
                 self.insert_blank(true);
                 true
             }
-            Chord::Palette | Chord::Sidebar => false,
+            Chord::Palette | Chord::Sidebar | Chord::FileSearch => false,
         }
     }
 

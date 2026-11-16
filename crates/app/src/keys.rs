@@ -18,6 +18,7 @@ pub enum Chord {
     InsertLineAbove,
     Palette,
     Sidebar,
+    FileSearch,
 }
 
 pub fn chord(ev: &KeyEvent) -> Option<Chord> {
@@ -51,7 +52,7 @@ pub fn chord(ev: &KeyEvent) -> Option<Chord> {
         ']' if !m.shift => Some(Chord::Indent),
         '[' if !m.shift => Some(Chord::Outdent),
         'l' if !m.shift => Some(Chord::SelectLine),
-        'p' if m.shift => Some(Chord::Palette),
+        'p' if m.shift => Some(Chord::FileSearch),
         'b' if !m.shift => Some(Chord::Sidebar),
         _ => None,
     }
@@ -121,7 +122,7 @@ mod tests {
         assert_eq!(chord(&cmd(']', false)), Some(Chord::Indent));
         assert_eq!(chord(&cmd('[', false)), Some(Chord::Outdent));
         assert_eq!(chord(&cmd('l', false)), Some(Chord::SelectLine));
-        assert_eq!(chord(&cmd('p', true)), Some(Chord::Palette));
+        assert_eq!(chord(&cmd('p', true)), Some(Chord::FileSearch));
         assert_eq!(chord(&cmd('b', false)), Some(Chord::Sidebar));
         assert_eq!(
             chord(&ev(
