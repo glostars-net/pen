@@ -356,7 +356,9 @@ impl Session {
                 continue;
             };
             if let Ok(result) = client.completion(rel, line, character) {
-                label = crate::complete::completion_label(&result);
+                label = crate::complete::completion_labels(&result)
+                    .into_iter()
+                    .next();
                 break;
             }
         }

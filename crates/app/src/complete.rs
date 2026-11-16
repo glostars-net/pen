@@ -1,16 +1,27 @@
 //! Tab completion. The language server wins. The buffer is the fallback.
 
-pub fn completion_label(result: &serde_json::Value) -> Option<String> {
-    let items = result
+pub fn completion_labels(result: &serde_json::Value) -> Vec<String> {
+    let Some(items) = result
         .as_array()
         .cloned()
-        .or_else(|| result.get("items").and_then(|v| v.as_array()).cloned())?;
-    let first = items.first()?;
-    first
-        .get("insertText")
-        .or_else(|| first.get("label"))
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
+        .or_else(|| result.get("items").and_then(|v| v.as_array()).cloned())
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get("insertText")
+                .or_else(|| item.get("label"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .take(20)
+        .collect()
+}
+
+pub fn completion_label(result: &serde_json::Value) -> Option<String> {
+    completion_labels(result).into_iter().next()
 }
 
 /// Longest word in `text` that starts with `prefix`, not equal to the prefix.
@@ -28,6 +39,27 @@ pub fn buffer_word(text: &str, prefix: &str) -> Option<String> {
         }
     }
     best
+}
+
+pub struct CompletionList {
+    pub items: Vec<String>,
+    pub selected: usize,
+}
+
+pub fn move_selection(list: &mut CompletionList, down: bool) {
+    if list.items.is_empty() {
+        return;
+    }
+    let n = list.items.len();
+    list.selected = if down {
+        (list.selected + 1) % n
+    } else {
+        (list.selected + n - 1) % n
+    };
+}
+
+pub fn selected_label(list: &CompletionList) -> Option<&str> {
+    list.items.get(list.selected).map(String::as_str)
 }
 
 pub fn clone_name(url: &str) -> Option<String> {
@@ -65,6 +97,18 @@ mod tests {
             Some("values")
         );
         assert_eq!(buffer_word("let value = 1;", ""), None);
+    }
+
+    #[test]
+    fn completion_selection_wraps() {
+        let mut list = CompletionList {
+            items: vec!["a".into(), "b".into(), "c".into()],
+            selected: 2,
+        };
+        move_selection(&mut list, true);
+        assert_eq!(selected_label(&list), Some("a"));
+        move_selection(&mut list, false);
+        assert_eq!(selected_label(&list), Some("c"));
     }
 
     #[test]
