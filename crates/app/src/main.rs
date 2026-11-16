@@ -192,7 +192,9 @@ enum IoCmd {
     },
     StartTerm {
         root: PathBuf,
+        program: Option<PathBuf>,
     },
+    ListShells,
     TermBytes(Vec<u8>),
     CloneRepo {
         parent: PathBuf,
@@ -261,9 +263,16 @@ enum IoMsg {
         path: String,
         option_id: Option<String>,
     },
-    TermRows(Vec<String>),
+    TermRows {
+        generation: u64,
+        rows: Vec<String>,
+        colors: Vec<Vec<u8>>,
+    },
+    Shells(Vec<PathBuf>),
     TermMissing,
-    TermStopped,
+    TermStopped {
+        generation: u64,
+    },
 }
 
 // The page is the large variant on purpose. Eight bytes of edit revision
@@ -329,16 +338,32 @@ struct Pen {
     term_open: bool,
     term_side: bool,
     term_rows: Vec<String>,
+    term_colors: Vec<Vec<u8>>,
+    term_seen: u64,
+    term_switching: bool,
+    term_menu: bool,
+    shells: Vec<PathBuf>,
+    shell_ix: usize,
     term_missing: bool,
     term_stopped: bool,
     term_focused: bool,
     clone_open: bool,
     clone_url: TextEdit,
-    complete_gen: u64,
+    complete_generation: u64,
     pending_complete: Option<PendingComplete>,
     ui_scale: i32,
     sheet_open: bool,
     token_edit: TextEdit,
+    settings_tab: u8,
+    theme_pick: String,
+    theme_menu: bool,
+    file_search_open: bool,
+    file_query: TextEdit,
+    file_index: usize,
+    paths: Vec<String>,
+    completion: Option<pen::complete::CompletionList>,
+    complete_prefix: usize,
+    meters: pen::meters::MeterPrefs,
 }
 
 struct PendingComplete {
@@ -418,16 +443,32 @@ fn init() -> Pen {
         term_open: false,
         term_side: false,
         term_rows: Vec::new(),
+        term_colors: Vec::new(),
+        term_seen: 0,
+        term_switching: false,
+        term_menu: false,
+        shells: Vec::new(),
+        shell_ix: 0,
         term_missing: false,
         term_stopped: false,
         term_focused: false,
         clone_open: false,
         clone_url: TextEdit::new(""),
-        complete_gen: 0,
+        complete_generation: 0,
         pending_complete: None,
         ui_scale: 100,
         sheet_open: false,
         token_edit: TextEdit::new(""),
+        settings_tab: 0,
+        theme_pick: String::new(),
+        theme_menu: false,
+        file_search_open: false,
+        file_query: TextEdit::new(""),
+        file_index: 0,
+        paths: Vec::new(),
+        completion: None,
+        complete_prefix: 0,
+        meters: pen::meters::MeterPrefs::default(),
     }
 }
 
@@ -531,7 +572,10 @@ fn setup(s: &mut Pen, waker: Waker) {
                 let mut active_watcher: Option<ProjectWatcher> = None;
                 let mut agent_tx: Option<tokio::sync::mpsc::Sender<pen_acp::Order>> = None;
                 let mut term_writer: Option<Box<dyn std::io::Write + Send>> = None;
-                let mut term_live = false;
+                let mut term_child: Option<std::process::Child> = None;
+                let mut term_program: Option<PathBuf> = None;
+                let mut term_generation = 0u64;
+                let term_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let git_cli_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 while let Some(cmd) = cmd_rx.recv().await {
                     let reply = match cmd {
@@ -958,14 +1002,35 @@ fn setup(s: &mut Pen, waker: Waker) {
                             }
                             continue;
                         }
-                        IoCmd::StartTerm { root } => {
-                            if term_live {
+                        IoCmd::ListShells => {
+                            let shells =
+                                pen_term::shells_from_path(std::env::var("PATH").ok().as_deref());
+                            let _ = msg_tx.send(IoMsg::Shells(shells)).await;
+                            waker();
+                            continue;
+                        }
+                        IoCmd::StartTerm { root, program } => {
+                            let wanted = program.clone();
+                            let running = term_alive.load(std::sync::atomic::Ordering::SeqCst);
+                            if running && (wanted.is_none() || wanted == term_program) {
                                 continue;
                             }
+                            if running {
+                                term_writer = None;
+                                if let Some(mut child) = term_child.take() {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                }
+                                term_alive.store(false, std::sync::atomic::Ordering::SeqCst);
+                                term_program = None;
+                            }
                             let shell = std::env::var("SHELL").ok();
-                            let program = std::env::var_os("PATH").and_then(|path| {
-                                std::env::split_paths(&path)
-                                    .find_map(|dir| pen_term::default_shell(&dir, shell.as_deref()))
+                            let program = wanted.or_else(|| {
+                                std::env::var_os("PATH").and_then(|path| {
+                                    std::env::split_paths(&path).find_map(|dir| {
+                                        pen_term::default_shell(&dir, shell.as_deref())
+                                    })
+                                })
                             });
                             let Some(program) = program else {
                                 let _ = msg_tx.send(IoMsg::TermMissing).await;
@@ -974,42 +1039,57 @@ fn setup(s: &mut Pen, waker: Waker) {
                             };
                             match pen_term::Shell::spawn(&program, &root) {
                                 Err(_) => {
-                                    let _ = msg_tx.send(IoMsg::TermStopped).await;
+                                    term_generation += 1;
+                                    let _ = msg_tx
+                                        .send(IoMsg::TermStopped {
+                                            generation: term_generation,
+                                        })
+                                        .await;
                                     waker();
                                 }
                                 Ok((shell_proc, mut reader)) => {
-                                    term_live = true;
+                                    term_generation += 1;
+                                    let generation = term_generation;
+                                    term_alive.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    term_program = Some(program);
+                                    term_child = Some(shell_proc.child);
                                     term_writer = Some(shell_proc.writer);
-                                    let hold = shell_proc.child;
+                                    let alive = term_alive.clone();
                                     let msg = msg_tx.clone();
                                     let wake = waker.clone();
                                     std::thread::spawn(move || {
-                                        let _hold = hold;
+                                        let mut screen = pen_term::Screen::new(80, 24);
                                         let mut buf = [0u8; 4096];
-                                        let mut raw = String::new();
                                         loop {
                                             match std::io::Read::read(&mut reader, &mut buf) {
                                                 Ok(0) | Err(_) => {
-                                                    let _ = msg.blocking_send(IoMsg::TermStopped);
+                                                    alive.store(
+                                                        false,
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                    );
+                                                    let _ = msg.blocking_send(IoMsg::TermStopped {
+                                                        generation,
+                                                    });
                                                     wake();
                                                     break;
                                                 }
                                                 Ok(n) => {
-                                                    raw.push_str(&String::from_utf8_lossy(
-                                                        &buf[..n],
-                                                    ));
-                                                    if raw.len() > 16_000 {
-                                                        raw.drain(..raw.len() - 8_000);
-                                                    }
-                                                    let rows = pen_term::screen_rows(&raw, 80);
-                                                    let tail = rows
-                                                        .into_iter()
-                                                        .rev()
-                                                        .take(24)
-                                                        .collect::<Vec<_>>();
-                                                    let rows = tail.into_iter().rev().collect();
-                                                    let _ =
-                                                        msg.blocking_send(IoMsg::TermRows(rows));
+                                                    screen.feed(&buf[..n]);
+                                                    let rows = (0..24)
+                                                        .map(|y| screen.row_text(y))
+                                                        .collect();
+                                                    let colors = (0..24)
+                                                        .map(|y| {
+                                                            (0..80)
+                                                                .map(|x| screen.color_at(x, y))
+                                                                .collect()
+                                                        })
+                                                        .collect();
+                                                    let _ = msg.blocking_send(IoMsg::TermRows {
+                                                        generation,
+                                                        rows,
+                                                        colors,
+                                                    });
                                                     wake();
                                                 }
                                             }
@@ -1172,6 +1252,11 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 entries,
                 watch_rx,
             } => {
+                s.paths = entries
+                    .iter()
+                    .filter(|entry| !entry.is_dir)
+                    .map(|entry| path_to_slash(&entry.rel))
+                    .collect();
                 s.files = build_file_tree(entries);
                 s.recents = recents::remember(&s.recents, &project.root);
                 if let Some(io_tx) = &s.io_tx {
@@ -1204,6 +1289,11 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
             }
             IoMsg::TreeRefreshed { entries } => {
                 let selected = s.files.cursor().map(str::to_owned);
+                s.paths = entries
+                    .iter()
+                    .filter(|entry| !entry.is_dir)
+                    .map(|entry| path_to_slash(&entry.rel))
+                    .collect();
                 s.files = build_file_tree(entries);
                 if let Some(id) = selected
                     && s.files.contains(&id)
@@ -1375,19 +1465,44 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 });
                 tx.instant();
             }
-            IoMsg::TermRows(rows) => {
+            IoMsg::Shells(shells) => {
+                s.shells = shells;
+                if s.shell_ix >= s.shells.len() {
+                    s.shell_ix = 0;
+                }
+                tx.instant();
+            }
+            IoMsg::TermRows {
+                generation,
+                rows,
+                colors,
+            } => {
+                if generation < s.term_seen {
+                    continue;
+                }
+                s.term_seen = generation;
                 s.term_rows = rows;
+                s.term_colors = colors;
                 s.term_missing = false;
+                s.term_stopped = false;
+                s.term_switching = false;
                 tx.instant();
             }
             IoMsg::TermMissing => {
                 s.term_missing = true;
+                s.term_switching = false;
                 tx.instant();
             }
-            IoMsg::TermStopped => {
-                if !s.term_stopped {
-                    s.term_stopped = true;
-                    s.term_rows.push("Shell stopped.".into());
+            IoMsg::TermStopped { generation } => {
+                let stale =
+                    generation < s.term_seen || (s.term_switching && generation == s.term_seen);
+                if !stale {
+                    s.term_seen = generation;
+                    s.term_switching = false;
+                    if !s.term_stopped {
+                        s.term_stopped = true;
+                        s.term_rows.push("Shell stopped.".into());
+                    }
                 }
                 tx.instant();
             }
@@ -1437,13 +1552,18 @@ fn take_lsp(s: &mut Pen, tx: &mut Tx) -> bool {
                 if pending.generation != generation {
                     continue;
                 }
-                let word = label.or(pending.fallback);
-                if let Some(word) = word
-                    && let OpenPage::Editor(ed) = &mut s.page
+                let mut items = Vec::new();
+                if let Some(word) = label {
+                    items.push(word);
+                }
+                if let Some(word) = pending.fallback
+                    && !items.contains(&word)
                 {
-                    let start = ed.caret.saturating_sub(pending.prefix_len);
-                    replace_prefix(ed, start, &word);
-                    s.note_edit();
+                    items.push(word);
+                }
+                if !items.is_empty() {
+                    s.complete_prefix = pending.prefix_len;
+                    s.completion = Some(pen::complete::CompletionList { items, selected: 0 });
                 }
                 tx.instant();
             }
@@ -1835,7 +1955,34 @@ impl Pen {
         self.new_project_open = false;
         self.settings_open = true;
         self.file_menu_open = false;
+        self.ask_shells();
         let _ = tx;
+    }
+
+    fn ask_shells(&mut self) {
+        if let Some(io_tx) = &self.io_tx {
+            let _ = io_tx.try_send(IoCmd::ListShells);
+        }
+    }
+
+    fn switch_shell(&mut self, index: usize, tx: &mut Tx) {
+        self.shell_ix = index;
+        self.term_menu = false;
+        let Some(program) = self.shells.get(index).cloned() else {
+            tx.instant();
+            return;
+        };
+        if self.term_open
+            && let (Some(project), Some(io_tx)) = (&self.project, &self.io_tx)
+        {
+            self.term_switching = true;
+            self.term_stopped = false;
+            let _ = io_tx.try_send(IoCmd::StartTerm {
+                root: project.root.clone(),
+                program: Some(program),
+            });
+        }
+        tx.instant();
     }
 
     fn close_folder(&mut self, tx: &mut Tx) {
@@ -2077,9 +2224,14 @@ impl Pen {
             && let Some(project) = &self.project
             && let Some(io_tx) = &self.io_tx
         {
+            let program = self.shells.get(self.shell_ix).cloned();
             let _ = io_tx.try_send(IoCmd::StartTerm {
                 root: project.root.clone(),
+                program,
             });
+        }
+        if self.term_open {
+            self.ask_shells();
         }
         if let OpenPage::Editor(ed) = &mut self.page {
             ed.focused = !self.term_focused;
@@ -2129,8 +2281,8 @@ impl Pen {
         }
         let text = ed.buffer.text();
         let fallback = pen::complete::buffer_word(&text, &prefix);
-        self.complete_gen += 1;
-        let generation = self.complete_gen;
+        self.complete_generation += 1;
+        let generation = self.complete_generation;
         let prefix_len = prefix.chars().count();
         let Some(rel) = self.active_path.clone() else {
             if let Some(word) = fallback
@@ -2157,6 +2309,29 @@ impl Pen {
         }
         let _ = start;
         let _ = prefix_len;
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(list) = self.completion.take() else {
+            return;
+        };
+        let Some(word) = pen::complete::selected_label(&list).map(str::to_owned) else {
+            return;
+        };
+        if let OpenPage::Editor(ed) = &mut self.page {
+            let start = ed.caret.saturating_sub(self.complete_prefix);
+            replace_prefix(ed, start, &word);
+            self.note_edit();
+        }
+    }
+
+    fn open_file_hit(&mut self, tx: &mut Tx) {
+        let hits = file_hits(self);
+        if let Some(path) = hits.get(self.file_index.min(hits.len().saturating_sub(1))) {
+            self.request_open_file(path, tx);
+        }
+        self.file_search_open = false;
+        tx.instant();
     }
 
     fn toggle_agent(&mut self, tx: &mut Tx) {
@@ -2591,7 +2766,19 @@ fn agent_pane(s: &Pen, theme: &Theme) -> El {
                 .on_submit(|s: &mut Pen, tx: &mut Tx| s.submit_agent(tx)),
         )
     };
-    pen::agent::agent_column(&s.agent_lines.lines, s.agent_missing, theme, input)
+    let header = row()
+        .w_full()
+        .h(24.0)
+        .center_y()
+        .justify_between()
+        .child(text("OpenCode").font(UI_MEDIUM_FONT).color(fg))
+        .child(
+            text("Close")
+                .font(UI_FONT)
+                .color(faint)
+                .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.toggle_agent(tx)),
+        );
+    pen::agent::agent_column(&s.agent_lines.lines, s.agent_missing, theme, input, header)
 }
 
 fn first_sheet(theme: &Theme) -> El {
@@ -2622,10 +2809,20 @@ fn first_sheet(theme: &Theme) -> El {
         )
 }
 
-fn term_panel(s: &Pen, theme: &Theme) -> El {
-    let fg = rgb_color(theme.fg);
-    let faint = rgb_color(theme.faint);
-    let bg = rgb_color(theme.bg);
+fn term_ground() -> rune::Color {
+    let (r, g, b) = pen_term::TERM_BG;
+    rgb_color(highlight::Rgb(r, g, b))
+}
+
+fn term_ink(code: u8) -> rune::Color {
+    let (r, g, b) = pen_term::ansi_rgb(code);
+    rgb_color(highlight::Rgb(r, g, b))
+}
+
+fn term_panel(s: &Pen) -> El {
+    let fg = term_ink(7);
+    let faint = term_ink(7).alpha(0.55);
+    let bg = term_ground();
     let rule = fg.alpha(0.20);
     let code = TextStyle {
         size: CODE_SIZE,
@@ -2664,6 +2861,7 @@ fn term_panel(s: &Pen, theme: &Theme) -> El {
             .h(24.0)
             .center_y()
             .child(text("Terminal").font(UI_MEDIUM_FONT).color(fg))
+            .child(shell_menu(s, fg, faint))
             .child(
                 text(if s.term_side { "Bottom" } else { "Side" })
                     .font(UI_FONT)
@@ -2675,15 +2873,79 @@ fn term_panel(s: &Pen, theme: &Theme) -> El {
         return body.child(text("No shell found.").font(UI_FONT).color(faint));
     }
     for (i, line) in s.term_rows.iter().enumerate() {
-        body = body.child(
-            text(line.clone())
-                .key(format!("pen/term-row-{i}"))
+        let colors = s.term_colors.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        body = body.child(term_row_el(i, line, colors, code, fg));
+    }
+    body
+}
+
+fn shell_label(s: &Pen) -> String {
+    s.shells
+        .get(s.shell_ix)
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Shell".into())
+}
+
+fn shell_menu(s: &Pen, fg: rune::Color, faint: rune::Color) -> El {
+    let mut menu =
+        col()
+            .gap(2.0)
+            .child(text(shell_label(s)).font(UI_FONT).color(faint).on_press_tx(
+                |s: &mut Pen, tx: &mut Tx| {
+                    s.term_menu = !s.term_menu;
+                    s.ask_shells();
+                    tx.instant();
+                },
+            ));
+    if s.term_menu {
+        for (i, path) in s.shells.iter().enumerate() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let ink = if i == s.shell_ix { fg } else { faint };
+            menu = menu.child(
+                text(name)
+                    .font(UI_FONT)
+                    .color(ink)
+                    .on_press_tx(move |s: &mut Pen, tx: &mut Tx| s.switch_shell(i, tx)),
+            );
+        }
+    }
+    menu
+}
+
+fn term_row_el(i: usize, line: &str, colors: &[u8], code: TextStyle, fg: rune::Color) -> El {
+    let chars: Vec<char> = line.chars().collect();
+    let mut row_el = row()
+        .key(format!("pen/term-row-{i}"))
+        .transition(Transition::none());
+    if chars.is_empty() {
+        return row_el.child(
+            text(" ")
                 .font(code)
                 .color(fg)
                 .transition(Transition::none()),
         );
     }
-    body
+    let mut at = 0;
+    while at < chars.len() {
+        let color = colors.get(at).copied().unwrap_or(7);
+        let mut end = at + 1;
+        while end < chars.len() && colors.get(end).copied().unwrap_or(7) == color {
+            end += 1;
+        }
+        let piece: String = chars[at..end].iter().collect();
+        row_el = row_el.child(
+            text(piece)
+                .font(code)
+                .color(term_ink(color))
+                .transition(Transition::none()),
+        );
+        at = end;
+    }
+    row_el
 }
 
 fn clone_bar(s: &Pen, theme: &Theme) -> El {
@@ -2719,9 +2981,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     let k = build_kit(&theme);
 
     let reduced = cx.is_reduced_motion();
-    let main_surface = if s.settings_open {
-        settings_page(s, &theme, reduced)
-    } else if s.new_project_open {
+    let main_surface = if s.new_project_open {
         new_project_page(s, &theme, reduced)
     } else {
         match (&s.project, &s.page) {
@@ -2772,7 +3032,17 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
                 })
             }
             (_, OpenPage::Editor(ed)) => {
-                editor_page_container(ed, &theme, cx.is_reduced_motion(), &s.open_diags)
+                let page = editor_page_container(ed, &theme, cx.is_reduced_motion(), &s.open_diags);
+                if let Some(list) = &s.completion {
+                    el().key("pen/editor-stack")
+                        .w_full()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .child(page)
+                        .child(completion_popup(list, ed, &theme))
+                } else {
+                    page
+                }
             }
         }
     };
@@ -2833,7 +3103,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     }
     page_stack = page_stack.child(main_surface);
     if s.term_open && !s.term_side {
-        page_stack = page_stack.child(term_panel(s, &theme));
+        page_stack = page_stack.child(term_panel(s));
     }
     let diag_note = caret_diag(s);
     let shown = s.status.clone().or(diag_note);
@@ -3060,7 +3330,7 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
     sidebar = sidebar.child(sidebar_body);
 
     let inspector = if s.term_open && s.term_side {
-        term_panel(s, &theme)
+        term_panel(s)
     } else {
         agent_pane(s, &theme)
     };
@@ -3075,10 +3345,27 @@ fn view(s: &Pen, cx: &mut Cx<Pen>) -> El {
         // Design: on the empty screen, "Open a folder" is the only control.
         split = split.hide_sidebar_toggle();
     }
-    let shell_el = split.build(&k);
+    let hover = if reduced {
+        Spring::NONE
+    } else {
+        Spring::new(0.12, 0.0)
+    };
+    let shell_el = split.build(&k).hover_motion_within(hover, hover);
     let mut overlays = menu_layer;
     if s.palette_open {
         overlays.push(palette_overlay(s, &theme));
+    }
+    if s.settings_open {
+        overlays.push(settings_page(s, &theme, reduced));
+    }
+    if s.file_search_open {
+        overlays.push(file_search_overlay(s, &theme));
+    }
+    if s.project.is_some() {
+        overlays.push(term_button(&theme));
+    }
+    if let Some(chips) = meter_bar(s, &theme) {
+        overlays.push(chips);
     }
     rune_kit::root(shell_el, overlays)
 }
@@ -3489,33 +3776,6 @@ fn choice_button(key: String, label: &'static str, on: bool, theme: &Theme) -> E
         .child(text(label).font(UI_MEDIUM_FONT).color(fg))
 }
 
-fn palette_list(s: &Pen, theme: &Theme) -> El {
-    let fg = rgb_color(theme.fg);
-    let bg = rgb_color(theme.bg);
-    let mut list = col().key("pen/palette-list").gap(4.0);
-    for item in highlight::catalog().into_iter().skip(2) {
-        let name = item.name;
-        let on = matches!(&s.theme_pref, ThemePref::Named(current) if current == &name);
-        let pick = name.clone();
-        list = list.child(
-            row()
-                .key(format!("pen/pal-{name}"))
-                .role("button")
-                .label(name.clone())
-                .h(28.0)
-                .px(8.0)
-                .center_y()
-                .cursor(Cursor::Pointer)
-                .fill(if on { fg.alpha(0.08) } else { bg })
-                .hover(fg.alpha(0.08))
-                .transition(Transition::opacity())
-                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| s.set_palette(pick.clone(), tx))
-                .child(text(name).font(UI_FONT).color(fg)),
-        );
-    }
-    list
-}
-
 fn grain(theme: &Theme) -> El {
     let ink = rgb_color(theme.fg).alpha(0.08);
     let mut layer = el().key("pen/grain").w(280.0).h(12.0);
@@ -3533,14 +3793,15 @@ fn settings_page(s: &Pen, theme: &Theme, reduced: bool) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
     let faint = rgb_color(theme.faint);
-    col()
+    let mut page = col()
         .key("pen/settings")
+        .absolute(0.0, 0.0)
         .w_full()
-        .grow(1.0)
-        .min_h(0.0)
+        .h_full()
         .fill(bg)
         .pt(32.0)
         .pl(48.0)
+        .pr(24.0)
         .gap(16.0)
         .opacity_motion(Spring::new(0.20, 0.0))
         .transition(page_motion(reduced))
@@ -3553,85 +3814,437 @@ fn settings_page(s: &Pen, theme: &Theme, reduced: bool) -> El {
             )),
         )
         .child(text("Settings").font(UI_MEDIUM_FONT).color(fg))
-        .child(text("Appearance").font(UI_FONT).color(faint))
-        .child(
-            row()
-                .gap(8.0)
-                .child(
-                    choice_button(
-                        "pen/set-system".into(),
-                        "System",
-                        matches!(s.theme_pref, ThemePref::System),
-                        theme,
+        .child(settings_tabs(s, theme));
+    page = match s.settings_tab {
+        1 => page.child(customize_page(s, theme)),
+        2 => page.child(terminal_settings(s, theme)),
+        3 => page.child(
+            text(if s.plugin_commands.is_empty() {
+                "No plugins loaded.".into()
+            } else {
+                s.plugin_commands.join(", ")
+            })
+            .font(UI_FONT)
+            .color(fg),
+        ),
+        4 => page
+            .child(
+                text("GitHub token, stored only on this Mac")
+                    .font(UI_FONT)
+                    .color(faint),
+            )
+            .child(
+                text_input(&s.token_edit, UI_FONT)
+                    .key("pen/token")
+                    .single_line()
+                    .w(280.0)
+                    .h(36.0)
+                    .color(fg)
+                    .on_edit(|s: &mut Pen| &mut s.token_edit)
+                    .on_submit(|s: &mut Pen, tx: &mut Tx| s.save_token(tx)),
+            ),
+        5 => page.child(meter_switches(s, theme)),
+        _ => page
+            .child(text("Name").font(UI_FONT).color(faint))
+            .child(
+                text_input(&s.name_edit, UI_FONT)
+                    .key("pen/name")
+                    .single_line()
+                    .w(280.0)
+                    .h(36.0)
+                    .color(fg)
+                    .caret(fg, fg.alpha(0.12))
+                    .on_edit(|s: &mut Pen| &mut s.name_edit)
+                    .on_submit(|s: &mut Pen, tx: &mut Tx| s.save_display_name(tx)),
+            )
+            .child(text("Scale").font(UI_FONT).color(faint))
+            .child(
+                row()
+                    .gap(8.0)
+                    .child(
+                        choice_button("pen/scale-90".into(), "90", s.ui_scale == 90, theme)
+                            .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_scale(90, tx)),
                     )
-                    .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("system", tx)),
-                )
-                .child(
-                    choice_button(
-                        "pen/set-ink".into(),
-                        "Ink",
-                        matches!(s.theme_pref, ThemePref::Ink),
-                        theme,
+                    .child(
+                        choice_button("pen/scale-100".into(), "100", s.ui_scale == 100, theme)
+                            .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_scale(100, tx)),
                     )
-                    .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("ink", tx)),
-                )
-                .child(
-                    choice_button(
-                        "pen/set-paper".into(),
-                        "Paper",
-                        matches!(s.theme_pref, ThemePref::Paper),
-                        theme,
-                    )
-                    .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_appearance("paper", tx)),
-                ),
-        )
-        .child(text("Type").font(UI_FONT).color(faint))
-        .child(
-            row()
-                .gap(8.0)
-                .child(
-                    choice_button("pen/scale-100".into(), "100", s.ui_scale == 100, theme)
-                        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_scale(100, tx)),
-                )
-                .child(
-                    choice_button("pen/scale-120".into(), "120", s.ui_scale == 120, theme)
-                        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_scale(120, tx)),
-                )
-                .child(
-                    choice_button("pen/scale-90".into(), "90", s.ui_scale == 90, theme)
-                        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_scale(90, tx)),
-                ),
-        )
-        .child(text("Palettes").font(UI_FONT).color(faint))
-        .child(palette_list(s, theme))
-        .child(
-            text("GitHub token, stored only on this Mac")
+                    .child(
+                        choice_button("pen/scale-120".into(), "120", s.ui_scale == 120, theme)
+                            .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.set_scale(120, tx)),
+                    ),
+            ),
+    };
+    page.child(grain(theme))
+}
+
+fn settings_tabs(s: &Pen, theme: &Theme) -> El {
+    let names = [
+        "General",
+        "Customize",
+        "Terminal",
+        "Plugins",
+        "Git",
+        "Advanced",
+    ];
+    let mut row_el = row().gap(8.0);
+    for (i, name) in names.iter().enumerate() {
+        let on = s.settings_tab == i as u8;
+        row_el = row_el.child(
+            text(*name)
+                .key(format!("pen/set-tab-{i}"))
+                .font(if on { UI_MEDIUM_FONT } else { UI_FONT })
+                .color(if on {
+                    rgb_color(theme.fg)
+                } else {
+                    rgb_color(theme.faint)
+                })
+                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+                    s.settings_tab = i as u8;
+                    tx.instant();
+                }),
+        );
+    }
+    row_el
+}
+
+fn customize_page(s: &Pen, theme: &Theme) -> El {
+    let pick = if s.theme_pick.is_empty() {
+        theme.name.clone()
+    } else {
+        s.theme_pick.clone()
+    };
+    let preview = highlight::theme_named(&pick);
+    let saved = pick.clone();
+    let mut body = col().gap(8.0).child(
+        text(pick)
+            .font(UI_MEDIUM_FONT)
+            .color(rgb_color(preview.fg))
+            .fill(rgb_color(preview.bg))
+            .on_press_tx(|s: &mut Pen, tx: &mut Tx| {
+                s.theme_menu = !s.theme_menu;
+                tx.instant();
+            }),
+    );
+    if s.theme_menu {
+        let mut list = col()
+            .key("pen/theme-menu")
+            .h(240.0)
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            });
+        for item in highlight::catalog() {
+            let name = item.name.clone();
+            let ink = rgb_color(item.fg);
+            let ground = rgb_color(item.bg);
+            let pick_name = name.clone();
+            list = list.child(
+                text(name)
+                    .font(UI_FONT)
+                    .color(ink)
+                    .fill(ground)
+                    .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+                        s.theme_pick = pick_name.clone();
+                        s.theme_menu = false;
+                        tx.instant();
+                    }),
+            );
+        }
+        body = body.child(list);
+    }
+    body.child(theme_preview(&preview)).child(
+        text("Save")
+            .font(UI_FONT)
+            .color(rgb_color(theme.fg))
+            .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+                let name = if s.theme_pick.is_empty() {
+                    saved.clone()
+                } else {
+                    s.theme_pick.clone()
+                };
+                if name == "Ink" {
+                    s.set_appearance("ink", tx);
+                } else if name == "Paper" {
+                    s.set_appearance("paper", tx);
+                } else {
+                    s.set_palette(name, tx);
+                }
+            }),
+    )
+}
+
+fn theme_preview(theme: &highlight::Theme) -> El {
+    let lines = [
+        "fn main() {".to_owned(),
+        "    let ink = 1;".to_owned(),
+        "    println!(\"pen\");".to_owned(),
+        "    // note".to_owned(),
+        "    ink".to_owned(),
+        "}".to_owned(),
+    ];
+    let paints = highlight::highlight_lines(Some("rust"), &lines, theme);
+    let fg = rgb_color(theme.fg);
+    let mut body = col()
+        .key("pen/theme-preview")
+        .fill(rgb_color(theme.bg))
+        .padding(8.0);
+    for (line, spans) in lines.iter().zip(paints) {
+        body = body.child(painted_line(line, &spans, fg));
+    }
+    body
+}
+
+fn painted_line(
+    line: &str,
+    spans: &[(std::ops::Range<usize>, highlight::Rgb)],
+    fg: rune::Color,
+) -> El {
+    if line.is_empty() {
+        return text(" ").font(UI_FONT).color(fg);
+    }
+    let mut row_el = row();
+    let mut cursor = 0;
+    for (range, rgb) in spans {
+        if range.start > cursor
+            && let Some(piece) = line.get(cursor..range.start)
+            && !piece.is_empty()
+        {
+            row_el = row_el.child(text(piece.to_owned()).font(UI_FONT).color(fg));
+        }
+        if let Some(piece) = line.get(range.clone())
+            && !piece.is_empty()
+        {
+            row_el = row_el.child(text(piece.to_owned()).font(UI_FONT).color(rgb_color(*rgb)));
+        }
+        cursor = range.end;
+    }
+    if cursor < line.len() {
+        row_el = row_el.child(text(line[cursor..].to_owned()).font(UI_FONT).color(fg));
+    }
+    row_el
+}
+
+fn terminal_settings(s: &Pen, theme: &Theme) -> El {
+    let faint = rgb_color(theme.faint);
+    let fg = rgb_color(theme.fg);
+    let mut body = col().gap(8.0).child(
+        text("Terminal uses the shell's own colors.")
+            .font(UI_FONT)
+            .color(faint),
+    );
+    if s.shells.is_empty() {
+        return body.child(text("No shell found.").font(UI_FONT).color(faint));
+    }
+    for (i, path) in s.shells.iter().enumerate() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let on = i == s.shell_ix;
+        body = body.child(
+            text(name)
+                .font(if on { UI_MEDIUM_FONT } else { UI_FONT })
+                .color(if on { fg } else { faint })
+                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| s.switch_shell(i, tx)),
+        );
+    }
+    body
+}
+
+fn term_button(theme: &Theme) -> El {
+    let fg = rgb_color(theme.fg);
+    let bg = rgb_color(theme.bg);
+    text("Terminal")
+        .key("pen/term-toggle")
+        .font(UI_FONT)
+        .color(fg)
+        .fill(bg)
+        .pin(None, None, Some(12.0), Some(12.0))
+        .w(88.0)
+        .h(28.0)
+        .on_press_tx(|s: &mut Pen, tx: &mut Tx| s.toggle_terminal(tx))
+}
+
+fn meter_bar(s: &Pen, theme: &Theme) -> Option<El> {
+    let labels = pen::meters::shown(&s.meters);
+    if labels.is_empty() {
+        return None;
+    }
+    let faint = rgb_color(theme.faint);
+    let mut bar = row()
+        .key("pen/meters")
+        .pin(Some(12.0), None, None, Some(12.0))
+        .gap(8.0);
+    for name in labels {
+        bar = bar.child(
+            text(format!("{name} unavailable"))
                 .font(UI_FONT)
                 .color(faint),
-        )
-        .child(
-            text_input(&s.token_edit, UI_FONT)
-                .key("pen/token")
-                .single_line()
-                .w(280.0)
-                .h(36.0)
+        );
+    }
+    Some(bar)
+}
+
+fn file_hits(s: &Pen) -> Vec<String> {
+    let q = s.file_query.text.to_lowercase();
+    s.paths
+        .iter()
+        .filter(|path| q.is_empty() || path.to_lowercase().contains(&q))
+        .cloned()
+        .collect()
+}
+
+fn file_search_overlay(s: &Pen, theme: &Theme) -> El {
+    let bg = rgb_color(theme.bg);
+    let fg = rgb_color(theme.fg);
+    let faint = rgb_color(theme.faint);
+    let hits = file_hits(s);
+    let selected = if hits.is_empty() {
+        0
+    } else {
+        s.file_index.min(hits.len() - 1)
+    };
+    let input = text_input(&s.file_query, UI_FONT)
+        .key("pen/file-search")
+        .label("File")
+        .single_line()
+        .placeholder("File name", faint)
+        .color(fg)
+        .caret(fg, fg.alpha(0.12))
+        .w_full()
+        .h(28.0)
+        .on_edit(|s: &mut Pen| &mut s.file_query)
+        .on_input_change(|s: &mut Pen, tx: &mut Tx| {
+            s.file_index = 0;
+            tx.instant();
+        })
+        .on_input_key(|s: &mut Pen, ev: &KeyEvent, tx: &mut Tx| match ev.key {
+            Key::Escape => {
+                s.file_search_open = false;
+                tx.instant();
+                true
+            }
+            Key::Down => {
+                s.file_index = s.file_index.saturating_add(1);
+                tx.instant();
+                true
+            }
+            Key::Up => {
+                s.file_index = s.file_index.saturating_sub(1);
+                tx.instant();
+                true
+            }
+            Key::Enter => {
+                s.open_file_hit(tx);
+                true
+            }
+            _ => false,
+        });
+    let mut list = col().key("pen/file-hits").w_full();
+    for (i, path) in hits.iter().enumerate().take(12) {
+        let ink = if i == selected { fg } else { faint };
+        let pick = path.clone();
+        list = list.child(
+            text(path.clone())
+                .font(if i == selected {
+                    UI_MEDIUM_FONT
+                } else {
+                    UI_FONT
+                })
+                .color(ink)
+                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+                    s.file_index = i;
+                    s.request_open_file(&pick, tx);
+                    s.file_search_open = false;
+                    tx.instant();
+                }),
+        );
+    }
+    let card = col()
+        .key("pen/file-card")
+        .w(440.0)
+        .mt(76.0)
+        .padding(12.0)
+        .gap(8.0)
+        .radius(6.0)
+        .fill(bg)
+        .border(1.0, fg.alpha(0.24))
+        .instant_changes()
+        .transition(Transition::none())
+        .child(input)
+        .child(list);
+    el().key("pen/file-search-backdrop")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(fg.alpha(0.10))
+        .transition(Transition::none())
+        .child(col().w_full().items_center().child(card))
+}
+
+fn completion_popup(list: &pen::complete::CompletionList, ed: &EditorState, theme: &Theme) -> El {
+    let fg = rgb_color(theme.fg);
+    let bg = rgb_color(theme.bg);
+    let faint = rgb_color(theme.faint);
+    let caret = ed.caret.min(ed.buffer.len_chars());
+    let line = ed.buffer.char_to_line(caret);
+    let col_at = caret - ed.buffer.line_to_char(line);
+    let x = 48.0 + col_at as f32 * ed.char_advance();
+    let y = (line as f32 * ed.line_h() - ed.scroll_y as f32).max(0.0) + ed.line_h();
+    let mut body = col()
+        .key("pen/complete")
+        .absolute(x, y)
+        .w(220.0)
+        .padding(8.0)
+        .gap(2.0)
+        .fill(bg)
+        .border(1.0, fg.alpha(0.24))
+        .instant_changes()
+        .transition(Transition::none());
+    for (i, label) in list.items.iter().enumerate().take(8) {
+        let ink = if i == list.selected { fg } else { faint };
+        body = body.child(
+            text(label.clone())
+                .font(if i == list.selected {
+                    UI_MEDIUM_FONT
+                } else {
+                    UI_FONT
+                })
+                .color(ink),
+        );
+    }
+    body
+}
+
+fn meter_switches(s: &Pen, theme: &Theme) -> El {
+    let fg = rgb_color(theme.fg);
+    let labels = pen::meters::shown(&s.meters);
+    let mut col_el = col().gap(8.0);
+    for name in ["CPU", "RAM", "Disk", "GPU"] {
+        let on = labels.contains(&name);
+        col_el = col_el.child(
+            text(format!("{name} {}", if on { "on" } else { "off" }))
+                .font(UI_FONT)
                 .color(fg)
-                .on_edit(|s: &mut Pen| &mut s.token_edit)
-                .on_submit(|s: &mut Pen, tx: &mut Tx| s.save_token(tx)),
-        )
-        .child(grain(theme))
-        .child(text("Name").font(UI_FONT).color(faint))
-        .child(
-            text_input(&s.name_edit, UI_FONT)
-                .key("pen/name")
-                .single_line()
-                .w(280.0)
-                .h(36.0)
-                .color(fg)
-                .caret(fg, fg.alpha(0.12))
-                .on_edit(|s: &mut Pen| &mut s.name_edit)
-                .on_submit(|s: &mut Pen, tx: &mut Tx| s.save_display_name(tx)),
-        )
+                .on_press_tx(move |s: &mut Pen, tx: &mut Tx| {
+                    match name {
+                        "CPU" => s.meters.cpu = !s.meters.cpu,
+                        "RAM" => s.meters.ram = !s.meters.ram,
+                        "Disk" => s.meters.disk = !s.meters.disk,
+                        _ => s.meters.gpu = !s.meters.gpu,
+                    }
+                    tx.instant();
+                }),
+        );
+    }
+    if labels.is_empty() {
+        col_el = col_el.child(
+            text("Meters are off.")
+                .font(UI_FONT)
+                .color(rgb_color(theme.faint)),
+        );
+    }
+    col_el
 }
 
 fn new_project_page(s: &Pen, theme: &Theme, reduced: bool) -> El {
@@ -4049,6 +4662,64 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
     }
+    if s.settings_open && ev.key == Key::Escape {
+        s.settings_open = false;
+        tx.instant();
+        return true;
+    }
+    if s.file_search_open {
+        match ev.key {
+            Key::Escape => {
+                s.file_search_open = false;
+                tx.instant();
+                return true;
+            }
+            Key::Down => {
+                s.file_index = s.file_index.saturating_add(1);
+                tx.instant();
+                return true;
+            }
+            Key::Up => {
+                s.file_index = s.file_index.saturating_sub(1);
+                tx.instant();
+                return true;
+            }
+            Key::Enter => {
+                s.open_file_hit(tx);
+                return true;
+            }
+            _ => return false,
+        }
+    }
+    if s.completion.is_some() && !s.term_focused {
+        match ev.key {
+            Key::Escape => {
+                s.completion = None;
+                tx.instant();
+                return true;
+            }
+            Key::Down => {
+                if let Some(list) = s.completion.as_mut() {
+                    pen::complete::move_selection(list, true);
+                }
+                tx.instant();
+                return true;
+            }
+            Key::Up => {
+                if let Some(list) = s.completion.as_mut() {
+                    pen::complete::move_selection(list, false);
+                }
+                tx.instant();
+                return true;
+            }
+            Key::Tab | Key::Enter => {
+                s.accept_completion();
+                tx.instant();
+                return true;
+            }
+            _ => {}
+        }
+    }
     if ev.key == Key::Tab && !s.term_focused && !s.palette_open && !s.find_open {
         s.request_completion();
         tx.instant();
@@ -4060,6 +4731,14 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 s.toggle_palette(tx);
                 return true;
             }
+            Chord::FileSearch if s.project.is_some() => {
+                s.file_search_open = true;
+                s.file_query.focused = true;
+                s.file_index = 0;
+                tx.instant();
+                return true;
+            }
+            Chord::FileSearch => {}
             Chord::Sidebar if s.project.is_some() => {
                 s.sidebar.toggle();
                 tx.instant();
@@ -4384,7 +5063,7 @@ fn term_bytes(ev: &KeyEvent) -> Option<Vec<u8>> {
     match &ev.key {
         Key::Text(t) if !ev.mods.cmd && !ev.mods.ctrl => Some(t.as_bytes().to_vec()),
         Key::Enter => Some(b"\r".to_vec()),
-        Key::Backspace => Some(vec![0x7f]),
+        Key::Backspace | Key::Delete => Some(vec![0x7f]),
         Key::Tab => Some(b"\t".to_vec()),
         Key::Up => Some(b"\x1b[A".to_vec()),
         Key::Down => Some(b"\x1b[B".to_vec()),

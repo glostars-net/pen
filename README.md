@@ -62,6 +62,7 @@ cargo run --release -p pen -- /path/to/folder
 | Action | macOS | Windows / Linux |
 | :--- | :--- | :--- |
 | Command palette | `⌘K` | `Ctrl+K` |
+| Search project files | `⇧⌘P` | `Ctrl+Shift+P` |
 | Open folder | `⌘O` | `Ctrl+O` |
 | Save (atomic temp + rename) | `⌘S` | `Ctrl+S` |
 | Find in file | `⌘F` (`Enter` next, `Esc` close) | `Ctrl+F` (`Enter` next, `Esc` close) |
@@ -72,6 +73,8 @@ cargo run --release -p pen -- /path/to/folder
 | Delete line | `⇧⌘K` | `Ctrl+Shift+K` |
 | Move line | `⌥↑` / `⌥↓` | `Alt+Up` / `Alt+Down` |
 | Indent / outdent | `⌘]` / `⌘[` | `Ctrl+]` / `Ctrl+[` |
+
+Settings covers the window and returns to the same file. Customize picks a named palette from a dropdown and previews it before Save. The terminal keeps a fixed dark ground and the shell's ANSI colors; Backspace erases a cell. CPU, RAM, disk, and GPU meters stay off until each switch is on, and an unreadable meter says "unavailable".
 
 ### Themes & custom `theme.json`
 
