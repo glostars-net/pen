@@ -49,12 +49,24 @@ impl GitCli {
             return Err(GitError::NotAllowed);
         }
 
+        let hooks = empty_hooks_dir();
         let mut child = Command::new(&self.program)
             .args(args)
             .current_dir(repo)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_MERGE_AUTOEDIT", "no")
             .env("GIT_EDITOR", ":")
+            // Repo config must not name a hook, fsmonitor, ssh command, or credential helper.
+            // shortcut: system git merge can still run a gitattributes merge driver. Upgrade when merge stays inside gix.
+            .env("GIT_CONFIG_COUNT", "4")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", &hooks)
+            .env("GIT_CONFIG_KEY_1", "core.fsmonitor")
+            .env("GIT_CONFIG_VALUE_1", "")
+            .env("GIT_CONFIG_KEY_2", "core.sshCommand")
+            .env("GIT_CONFIG_VALUE_2", "ssh")
+            .env("GIT_CONFIG_KEY_3", "credential.helper")
+            .env("GIT_CONFIG_VALUE_3", "")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
@@ -99,6 +111,12 @@ impl GitCli {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
+}
+
+fn empty_hooks_dir() -> String {
+    let dir = std::env::temp_dir().join("pen-no-git-hooks");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().into_owned()
 }
 
 fn find_git_in_path(path_var: &std::ffi::OsStr) -> Option<GitCli> {

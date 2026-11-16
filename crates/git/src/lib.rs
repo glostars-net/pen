@@ -74,11 +74,23 @@ pub struct WorktreeInfo {
     pub branch: String,
 }
 
+fn repository_config_is_not_a_command_source(meta: &gix::config::file::Metadata) -> bool {
+    meta.source.kind() != gix::config::source::Kind::Repository
+}
+
 impl Repo {
     /// Discover a repository starting at (or above) `start`. `Ok(None)` when
     /// no repository is found; any other failure is a real `GitError`.
     pub fn discover(start: &Path) -> Result<Option<Self>, GitError> {
-        let inner = match gix::discover(start) {
+        // A folder the user opens is not a trusted git config. Repository-local
+        // `filter` / `diff` / `merge` commands would otherwise run during status.
+        let open = gix::open::Options::default()
+            .filter_config_section(repository_config_is_not_a_command_source);
+        let inner = match gix::discover_opts(
+            start,
+            gix::discover::upwards::Options::default(),
+            open,
+        ) {
             Ok(inner) => inner,
             Err(err) => {
                 return if err
@@ -1097,6 +1109,39 @@ mod tests {
         let dir = std::env::temp_dir().join("pen-not-a-repo");
         std::fs::create_dir_all(&dir).unwrap();
         assert!(Repo::discover(&dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn status_does_not_run_a_repo_filter() {
+        let dir = std::env::temp_dir().join(format!("pen-git-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("keep.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join(".gitattributes"), "* filter=pwn\n").unwrap();
+        git(&dir, &["add", "keep.rs", ".gitattributes"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        let marker = dir.join("pwned");
+        let clean = format!("touch {}", marker.display());
+        let config = format!(
+            "\n[filter \"pwn\"]\n\tprocess = {clean}\n\tclean = {clean}\n\trequired = true\n"
+        );
+        use std::io::Write;
+        let mut cfg = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(".git/config"))
+            .unwrap();
+        cfg.write_all(config.as_bytes()).unwrap();
+        std::fs::write(dir.join("keep.rs"), "fn main() { changed(); }\n").unwrap();
+
+        let repo = Repo::discover(&dir).unwrap().unwrap();
+        let _ = repo.status();
+        let _ = repo.diff_worktree(Path::new("keep.rs"));
+        assert!(
+            !marker.exists(),
+            "opening status ran a filter from the repository config"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
