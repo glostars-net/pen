@@ -43,14 +43,7 @@ jobs:
           cp target/release/pen "$stage/pen"
           chmod 755 "$stage/pen"
           codesign --sign - --force "$stage/pen"
-          cat > "$stage/Install Pen.command" << 'EOF'
-          #!/bin/sh
-          cd "$(dirname "$0")"
-          mkdir -p /usr/local/bin
-          cp -f pen /usr/local/bin/pen
-          chmod 755 /usr/local/bin/pen
-          echo "pen is in /usr/local/bin. Open a new terminal and run: pen"
-          EOF
+          printf '%s\n' '#!/bin/sh' 'cd "$(dirname "$0")"' 'mkdir -p /usr/local/bin' 'cp -f pen /usr/local/bin/pen' 'chmod 755 /usr/local/bin/pen' 'echo "pen is in /usr/local/bin. Open a new terminal and run: pen"' > "$stage/Install Pen.command"
           chmod 755 "$stage/Install Pen.command"
           hdiutil create -volname Pen -srcfolder "$stage" -ov -format UDZO Pen-macOS.dmg
       - name: Package Windows
@@ -72,17 +65,7 @@ jobs:
           mkdir -p "$root/DEBIAN" "$root/usr/bin"
           cp target/release/pen "$root/usr/bin/pen"
           chmod 755 "$root/usr/bin/pen"
-          cat > "$root/DEBIAN/control" << EOF
-Package: pen
-Version: ${version}
-Section: editors
-Priority: optional
-Architecture: amd64
-Maintainer: Glostars <https://glostars.net>
-Depends: libxkbcommon0, libwayland-client0, libvulkan1
-Description: Pen, a code editor
- A native editor. After install, run pen or pen /path/to/folder.
-EOF
+          printf '%s\n' "Package: pen" "Version: ${version}" "Section: editors" "Priority: optional" "Architecture: amd64" "Maintainer: Glostars <https://glostars.net>" "Depends: libxkbcommon0, libwayland-client0, libvulkan1" "Description: Pen, a code editor" " A native editor. After install, run pen or pen /path/to/folder." > "$root/DEBIAN/control"
           dpkg-deb --build "$root" Pen-Linux.deb
       - uses: actions/upload-artifact@v4
         with:
