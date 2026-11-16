@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS
+            asset: Pen-macOS.dmg
+          - os: windows-latest
+            name: Windows
+            asset: Pen-Windows.msi
+          - os: ubuntu-latest
+            name: Linux
+            asset: Pen-Linux.deb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - name: Build
+        run: cargo build --release -p pen
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/Pen"
+          mkdir -p "$stage"
+          cp target/release/pen "$stage/pen"
+          chmod 755 "$stage/pen"
+          codesign --sign - --force "$stage/pen"
+          cat > "$stage/Install Pen.command" << 'EOF'
+          #!/bin/sh
+          cd "$(dirname "$0")"
+          mkdir -p /usr/local/bin
+          cp -f pen /usr/local/bin/pen
+          chmod 755 /usr/local/bin/pen
+          echo "pen is in /usr/local/bin. Open a new terminal and run: pen"
+          EOF
+          chmod 755 "$stage/Install Pen.command"
+          hdiutil create -volname Pen -srcfolder "$stage" -ov -format UDZO Pen-macOS.dmg
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { $version = "0.1.0" }
+          Copy-Item target/release/pen.exe packaging/windows/pen.exe
+          (Get-Content packaging/windows/pen.wxs) -replace '0\.1\.0\.0', "$version.0" | Set-Content packaging/windows/pen.wxs
+          wix build packaging/windows/pen.wxs -o Pen-Windows.msi -arch x64
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          root="$RUNNER_TEMP/pen-deb"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin"
+          cp target/release/pen "$root/usr/bin/pen"
+          chmod 755 "$root/usr/bin/pen"
+          cat > "$root/DEBIAN/control" << EOF
+Package: pen
+Version: ${version}
+Section: editors
+Priority: optional
+Architecture: amd64
+Maintainer: Glostars <https://glostars.net>
+Depends: libxkbcommon0, libwayland-client0, libvulkan1
+Description: Pen, a code editor
+ A native editor. After install, run pen or pen /path/to/folder.
+EOF
+          dpkg-deb --build "$root" Pen-Linux.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Pen-macOS.dmg
+            Pen-Windows.msi
+            Pen-Linux.deb
+          generate_release_notes: true

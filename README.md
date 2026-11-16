@@ -82,7 +82,7 @@ Rust `1.99.1` is pinned by `rust-toolchain.toml`.
 
 ```sh
 # with just (brew install just)
-just run                         # empty page: Open a folder
+just run                         # opens the current directory
 just run /path/to/folder
 just gate                        # fmt, clippy -D warnings, tests, perf budgets
 
@@ -90,6 +90,10 @@ just gate                        # fmt, clippy -D warnings, tests, perf budgets
 cargo run --release -p pen
 cargo run --release -p pen -- /path/to/folder
 ```
+
+Installed from [glostars.net/pen](https://glostars.net/pen), the command is `pen`. With no folder it opens the current directory. `pen ~/notes` opens that folder.
+
+The installers are the latest GitHub release: `Pen-macOS.dmg`, `Pen-Windows.msi`, and `Pen-Linux.deb`. They are built when a `v*` tag is pushed.
 
 There is no installer, `.dmg`, or auto-updater. The deliverable is the release binary.
 

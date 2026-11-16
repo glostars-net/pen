@@ -475,6 +475,17 @@ fn init() -> Pen {
     }
 }
 
+/// `pen` opens the current directory. `pen {folder}` opens that folder.
+fn folder_to_open(arg: Option<&str>, cwd: &Path) -> PathBuf {
+    match arg {
+        Some(raw) => {
+            let path = PathBuf::from(raw);
+            if path.is_absolute() { path } else { cwd.join(path) }
+        }
+        None => cwd.to_path_buf(),
+    }
+}
+
 fn setup(s: &mut Pen, waker: Waker) {
     if !rune::is_headless() {
         let wake = waker.clone();
@@ -487,8 +498,10 @@ fn setup(s: &mut Pen, waker: Waker) {
     let (msg_tx, msg_rx) = mpsc::channel::<IoMsg>(32);
     let (git_trigger_tx, mut git_trigger_rx) = mpsc::channel::<PathBuf>(8);
     let (git_tx, git_rx) = watch::channel(GitSnapshot::default());
-    if !headless && let Some(arg) = rune::extra_args().iter().find(|a| !a.starts_with('-')) {
-        let _ = cmd_tx.try_send(IoCmd::OpenProject(PathBuf::from(arg)));
+    if !headless {
+        let arg = rune::extra_args().iter().find(|a| !a.starts_with('-'));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let _ = cmd_tx.try_send(IoCmd::OpenProject(folder_to_open(arg.map(String::as_str), &cwd)));
     }
     std::thread::Builder::new()
         .name("pen-io".into())
@@ -5097,6 +5110,27 @@ fn term_bytes(ev: &KeyEvent) -> Option<Vec<u8>> {
         Key::Right => Some(b"\x1b[C".to_vec()),
         Key::Left => Some(b"\x1b[D".to_vec()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    #[test]
+    fn bare_pen_opens_the_current_directory() {
+        let cwd = Path::new("/work/pen");
+        assert_eq!(folder_to_open(None, cwd), cwd);
+    }
+
+    #[test]
+    fn a_folder_argument_opens_that_folder() {
+        let cwd = Path::new("/work");
+        assert_eq!(
+            folder_to_open(Some("/tmp/notes"), cwd),
+            PathBuf::from("/tmp/notes")
+        );
+        assert_eq!(folder_to_open(Some("notes"), cwd), cwd.join("notes"));
     }
 }
 

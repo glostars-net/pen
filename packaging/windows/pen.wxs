@@ -1,0 +1,31 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Pen"
+    Manufacturer="Glostars"
+    Version="0.1.0.0"
+    UpgradeCode="7c2e1a40-9b3d-4f6a-8c11-0a1b2c3d4e5f">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Pen is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Feature Id="Main">
+      <ComponentGroupRef Id="PenComponents" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="PenFolder" Name="Pen" />
+    </StandardDirectory>
+    <ComponentGroup Id="PenComponents" Directory="PenFolder">
+      <Component>
+        <File Id="PenExe" Source="pen.exe" KeyPath="yes" />
+        <Environment
+          Id="PenPath"
+          Name="PATH"
+          Value="[PenFolder]"
+          Action="set"
+          Part="last"
+          System="no" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>
