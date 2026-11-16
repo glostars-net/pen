@@ -197,7 +197,7 @@ pub fn catalog() -> Vec<Theme> {
     let relations = ["analogous", "complementary", "split", "triadic"];
     for (i, hue) in seeds.iter().enumerate() {
         for (j, relation) in relations.iter().enumerate() {
-            themes.push(generated_theme(*hue, relation, i + j));
+            themes.push(generated_theme(*hue, relation, i * 4 + j));
         }
     }
     themes
@@ -209,6 +209,14 @@ pub fn theme_named(name: &str) -> Theme {
         .find(|theme| theme.name == name)
         .unwrap_or_else(ink)
 }
+
+const PALETTE_NAMES: [&str; 48] = [
+    "Clay", "Ochre", "Sand", "Moss", "Fern", "Olive", "Pine", "Sea", "Tide", "Slate", "Dusk",
+    "Iris", "Plum", "Wine", "Rose", "Coral", "Ember", "Copper", "Amber", "Honey", "Straw", "Linen",
+    "Pearl", "Fog", "Ash", "Stone", "Graphite", "Night", "Coal", "Bark", "Cedar", "Sage", "Mint",
+    "Lagoon", "Glacier", "Steel", "Violet", "Berry", "Blush", "Terra", "Sienna", "Gold", "Cream",
+    "Ivory", "Pewter", "Smoke", "Heath", "Reed",
+];
 
 fn generated_theme(hue: f32, relation: &str, salt: usize) -> Theme {
     let dark = salt.is_multiple_of(2);
@@ -238,7 +246,7 @@ fn generated_theme(hue: f32, relation: &str, salt: usize) -> Theme {
     let removed = walk_to_contrast(mix_oklab(fg, bg, 0.44), fg, bg);
     let mix_u8 = |f: u8, b: u8| (0.12 * f32::from(f) + 0.88 * f32::from(b)).round() as u8;
     Theme {
-        name: format!("{relation} {hue:.0}"),
+        name: PALETTE_NAMES[salt % PALETTE_NAMES.len()].to_owned(),
         bg,
         fg,
         faint,
@@ -472,6 +480,12 @@ mod tests {
             }
         }
         assert_eq!(theme_named("nope").name, "Ink");
+        assert_eq!(theme_named("analogous 0").name, "Ink");
+        assert!(
+            themes
+                .iter()
+                .all(|theme| !theme.name.chars().any(|c| c.is_ascii_digit()))
+        );
     }
 
     #[test]
