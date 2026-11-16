@@ -47,6 +47,8 @@ cargo run --release -p pen
 cargo run --release -p pen -- /path/to/folder
 ```
 
+Release is stripped and size-optimized (`lto`, one codegen unit, `opt-level = "z"`, `panic = abort`). Plugins stay on. Measured on this machine: 58,542,992 bytes before those flags, 20,642,608 after. `cargo build --release -p pen --no-default-features` is 17,824,304 bytes and has no plugin host.
+
 ### Platform notes
 
 | Platform | Targets | System prerequisites |

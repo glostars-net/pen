@@ -13,11 +13,15 @@ path = "src/lib.rs"
 name = "pen"
 path = "src/main.rs"
 
+[features]
+default = ["plugins"]
+plugins = ["pen-plugins/host"]
+
 [dependencies]
 buffer = { path = "../buffer" }
 highlight = { path = "../highlight" }
 pen-acp = { path = "../acp" }
-pen-plugins = { path = "../plugins" }
+pen-plugins = { path = "../plugins", default-features = false }
 pen-term = { path = "../term" }
 pen-lsp = { path = "../lsp" }
 pen-git = { path = "../git" }

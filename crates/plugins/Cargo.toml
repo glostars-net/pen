@@ -5,10 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Pen's WASM plugin host. Commands and theme JSON only."
 
+[features]
+default = ["host"]
+host = ["dep:wasmtime"]
+
 [dependencies]
 highlight = { path = "../highlight" }
 thiserror.workspace = true
-wasmtime = { version = "50.0.1", default-features = false, features = ["cranelift", "runtime", "component-model", "std"] }
+wasmtime = { version = "50.0.1", optional = true, default-features = false, features = ["cranelift", "runtime", "component-model", "std"] }
 
 [lints]
 workspace = true

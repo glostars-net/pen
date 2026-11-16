@@ -44,5 +44,8 @@ debug = "line-tables-only"
 debug = false
 
 [profile.release]
-lto = "thin"
-debug = false
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"
+panic = "abort"

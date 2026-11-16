@@ -1,12 +1,16 @@
 //! Plugin host. A plugin may register a command name and a theme JSON string.
 //! It cannot read the disk, open a socket, or draw UI.
 
-use std::sync::OnceLock;
-
 use thiserror::Error;
+
+#[cfg(feature = "host")]
+use std::sync::OnceLock;
+#[cfg(feature = "host")]
 use wasmtime::component::{Component, HasSelf, Linker};
+#[cfg(feature = "host")]
 use wasmtime::{Engine, Store};
 
+#[cfg(feature = "host")]
 mod bindings {
     wasmtime::component::bindgen!({
         world: "pen",
@@ -67,6 +71,7 @@ impl Host {
     }
 
     /// Instantiate a component and call `init`. No WASI. Fuel is 1_000_000.
+    #[cfg(feature = "host")]
     pub fn load(&mut self, wasm: &[u8]) -> Result<(), PluginError> {
         let engine = engine()?;
         let component = Component::from_binary(engine, wasm).map_err(|_| PluginError::Load)?;
@@ -87,8 +92,14 @@ impl Host {
             Err(_) => Err(PluginError::Trap),
         }
     }
+
+    #[cfg(not(feature = "host"))]
+    pub fn load(&mut self, _wasm: &[u8]) -> Result<(), PluginError> {
+        Err(PluginError::Load)
+    }
 }
 
+#[cfg(feature = "host")]
 fn engine() -> Result<&'static Engine, PluginError> {
     static ENGINE: OnceLock<Result<Engine, ()>> = OnceLock::new();
     ENGINE
@@ -102,6 +113,7 @@ fn engine() -> Result<&'static Engine, PluginError> {
         .map_err(|_| PluginError::Load)
 }
 
+#[cfg(feature = "host")]
 #[derive(Default)]
 struct State {
     commands: Vec<String>,
@@ -153,6 +165,7 @@ fn accept_command(commands: &mut Vec<String>, name: &str) -> Result<(), PluginEr
     Ok(())
 }
 
+#[cfg(feature = "host")]
 impl bindings::pen::host::host::Host for State {
     fn register_command(&mut self, name: String) -> Result<(), String> {
         accept_command(&mut self.commands, &name).map_err(|e| e.to_string())
@@ -179,6 +192,7 @@ mod tests {
         assert!(host.commands.is_empty());
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn load_hello_registers_command() {
         let mut host = Host {
@@ -190,6 +204,7 @@ mod tests {
         assert_eq!(host.commands, vec!["Hello".to_owned()]);
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn core_module_is_not_a_component() {
         let mut host = Host {
@@ -220,6 +235,7 @@ mod tests {
         assert!(host.themes.is_empty());
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn trap_does_not_kill_the_host() {
         let mut host = Host {
