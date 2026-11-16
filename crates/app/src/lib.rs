@@ -14,6 +14,7 @@ pub mod git_panel;
 pub mod goto;
 pub mod keys;
 pub mod lsp_host;
+pub mod meters;
 pub mod palette;
 pub mod recents;
 pub mod scaffold;

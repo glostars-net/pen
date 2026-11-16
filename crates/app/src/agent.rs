@@ -3,7 +3,7 @@
 use highlight::Theme;
 use rune::{El, Transition, col, text};
 
-use crate::theme_kit::{UI_FONT, UI_MEDIUM_FONT, rgb_color};
+use crate::theme_kit::{UI_FONT, rgb_color};
 
 pub struct Transcript {
     pub lines: Vec<String>,
@@ -20,7 +20,13 @@ impl Transcript {
 }
 
 /// Solid  column. The caller supplies the one-line input, or none when OpenCode is missing.
-pub fn agent_column(lines: &[String], missing: bool, theme: &Theme, input: Option<El>) -> El {
+pub fn agent_column(
+    lines: &[String],
+    missing: bool,
+    theme: &Theme,
+    input: Option<El>,
+    header: El,
+) -> El {
     let bg = rgb_color(theme.bg);
     let fg = rgb_color(theme.fg);
     let faint = rgb_color(theme.faint);
@@ -33,7 +39,7 @@ pub fn agent_column(lines: &[String], missing: bool, theme: &Theme, input: Optio
         .padding(12.0)
         .gap(8.0)
         .transition(Transition::none())
-        .child(text("OpenCode").font(UI_MEDIUM_FONT).color(fg));
+        .child(header);
     if missing {
         return body.child(
             text("OpenCode is not installed.")
