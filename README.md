@@ -1,6 +1,5 @@
 <p align="center">
   <a href="https://glostars.net">
-    <img src="assets/brand/glostars.png" width="120" alt="Glostars">
   </a>
   <br>
   <img src="assets/icons/pen-512.png" width="88" alt="Pen">
