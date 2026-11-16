@@ -33,6 +33,18 @@ pub fn shells_from_path(path_env: Option<&str>) -> Vec<PathBuf> {
 /// Fixed terminal ground. Pen’s theme is not an input.
 pub const TERM_BG: (u8, u8, u8) = (0x12, 0x11, 0x0f);
 
+/// First row to paint so `cursor_y` stays inside a window of `fit` rows.
+pub fn visible_start(rows: usize, cursor_y: usize, fit: usize) -> usize {
+    let fit = fit.max(1);
+    if rows <= fit {
+        return 0;
+    }
+    cursor_y
+        .saturating_add(1)
+        .saturating_sub(fit)
+        .min(rows - fit)
+}
+
 pub fn ansi_rgb(code: u8) -> (u8, u8, u8) {
     match code {
         0 => (0x1a, 0x19, 0x16),
@@ -90,23 +102,27 @@ impl Screen {
                 while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
                     i += 1;
                 }
-                if i < bytes.len() && bytes[i] == b'm' {
-                    let params = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
-                    for part in params.split(';') {
-                        self.fg = match part {
-                            "31" => 1,
-                            "32" => 2,
-                            "33" => 3,
-                            "34" => 4,
-                            "35" => 5,
-                            "36" => 6,
-                            "30" => 0,
-                            "37" | "0" | "" => 7,
-                            _ => self.fg,
-                        };
-                    }
-                }
                 if i < bytes.len() {
+                    match bytes[i] {
+                        b'm' => {
+                            let params = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+                            for part in params.split(';') {
+                                self.fg = match part {
+                                    "31" => 1,
+                                    "32" => 2,
+                                    "33" => 3,
+                                    "34" => 4,
+                                    "35" => 5,
+                                    "36" => 6,
+                                    "30" => 0,
+                                    "37" | "0" | "" => 7,
+                                    _ => self.fg,
+                                };
+                            }
+                        }
+                        b'K' => self.erase_to_end(),
+                        _ => {}
+                    }
                     i += 1;
                 }
                 continue;
@@ -117,25 +133,56 @@ impl Screen {
                         self.x -= 1;
                     }
                     self.put(' ');
-                    if self.x > 0 {
-                        self.x -= 1;
-                    }
                 }
                 b'\r' => self.x = 0,
-                b'\n' => {
-                    self.x = 0;
-                    self.y = (self.y + 1).min(self.rows.saturating_sub(1));
-                }
+                b'\n' => self.next_line(),
                 b => {
+                    if self.x >= self.cols {
+                        self.next_line();
+                    }
                     self.put(b as char);
                     self.x += 1;
-                    if self.x >= self.cols {
-                        self.x = 0;
-                        self.y = (self.y + 1).min(self.rows.saturating_sub(1));
-                    }
                 }
             }
             i += 1;
+        }
+    }
+
+    pub fn cursor_y(&self) -> usize {
+        self.y
+    }
+
+    fn next_line(&mut self) {
+        self.x = 0;
+        if self.y + 1 >= self.rows {
+            self.scroll_up();
+        } else {
+            self.y += 1;
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        let cols = self.cols;
+        if self.rows == 0 || cols == 0 {
+            return;
+        }
+        self.cells.copy_within(cols.., 0);
+        self.color.copy_within(cols.., 0);
+        let start = cols * self.rows.saturating_sub(1);
+        for cell in &mut self.cells[start..] {
+            *cell = ' ';
+        }
+        for ink in &mut self.color[start..] {
+            *ink = 7;
+        }
+        self.y = self.rows - 1;
+    }
+
+    fn erase_to_end(&mut self) {
+        let start = self.y * self.cols + self.x.min(self.cols);
+        let end = (self.y + 1) * self.cols;
+        for cell in &mut self.cells[start..end] {
+            *cell = ' ';
         }
     }
 
@@ -287,6 +334,32 @@ mod tests {
     }
 
     #[test]
+    fn backspace_on_hi_leaves_h() {
+        let mut screen = Screen::new(8, 2);
+        screen.feed(b"hi\x7f");
+        assert_eq!(screen.row_text(0).trim_end(), "h");
+        screen.feed(b"b");
+        assert_eq!(screen.row_text(0).trim_end(), "hb");
+        screen.feed(b"\x08 \x08");
+        assert_eq!(screen.row_text(0).trim_end(), "h");
+    }
+
+    #[test]
+    fn a_full_screen_scrolls_the_oldest_row_off() {
+        let mut screen = Screen::new(4, 2);
+        screen.feed(b"aaaa\nbbbb\ncccc");
+        assert_eq!(screen.row_text(0).trim_end(), "bbbb");
+        assert_eq!(screen.row_text(1).trim_end(), "cccc");
+    }
+
+    #[test]
+    fn erase_to_end_clears_the_rest_of_the_row() {
+        let mut screen = Screen::new(6, 1);
+        screen.feed(b"abcdef\r\x1b[K");
+        assert_eq!(screen.row_text(0).trim_end(), "");
+    }
+
+    #[test]
     fn backspace_erases_the_character() {
         let mut screen = Screen::new(8, 2);
         screen.feed(b"a\x7fb");
@@ -303,6 +376,7 @@ mod tests {
     fn ansi_color_is_not_the_terminal_ground() {
         assert_ne!(ansi_rgb(1), TERM_BG);
         assert!(shells_from_path(None).is_empty());
+        assert_eq!(visible_start(24, 23, 6), 18);
     }
 
     #[test]

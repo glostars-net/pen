@@ -267,6 +267,7 @@ enum IoMsg {
         generation: u64,
         rows: Vec<String>,
         colors: Vec<Vec<u8>>,
+        cursor_y: usize,
     },
     Shells(Vec<PathBuf>),
     TermMissing,
@@ -339,6 +340,7 @@ struct Pen {
     term_side: bool,
     term_rows: Vec<String>,
     term_colors: Vec<Vec<u8>>,
+    term_cursor: usize,
     term_seen: u64,
     term_switching: bool,
     term_menu: bool,
@@ -444,6 +446,7 @@ fn init() -> Pen {
         term_side: false,
         term_rows: Vec::new(),
         term_colors: Vec::new(),
+        term_cursor: 0,
         term_seen: 0,
         term_switching: false,
         term_menu: false,
@@ -1085,10 +1088,12 @@ fn setup(s: &mut Pen, waker: Waker) {
                                                                 .collect()
                                                         })
                                                         .collect();
+                                                    let cursor_y = screen.cursor_y();
                                                     let _ = msg.blocking_send(IoMsg::TermRows {
                                                         generation,
                                                         rows,
                                                         colors,
+                                                        cursor_y,
                                                     });
                                                     wake();
                                                 }
@@ -1476,6 +1481,7 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 generation,
                 rows,
                 colors,
+                cursor_y,
             } => {
                 if generation < s.term_seen {
                     continue;
@@ -1483,6 +1489,7 @@ fn poll(s: &mut Pen, _now: f64, tx: &mut Tx) -> bool {
                 s.term_seen = generation;
                 s.term_rows = rows;
                 s.term_colors = colors;
+                s.term_cursor = cursor_y;
                 s.term_missing = false;
                 s.term_stopped = false;
                 s.term_switching = false;
@@ -1545,17 +1552,14 @@ fn take_lsp(s: &mut Pen, tx: &mut Tx) -> bool {
                 }
                 tx.instant();
             }
-            LspEvent::Completion { generation, label } => {
+            LspEvent::Completion { generation, labels } => {
                 let Some(pending) = s.pending_complete.take() else {
                     continue;
                 };
                 if pending.generation != generation {
                     continue;
                 }
-                let mut items = Vec::new();
-                if let Some(word) = label {
-                    items.push(word);
-                }
+                let mut items = labels;
                 if let Some(word) = pending.fallback
                     && !items.contains(&word)
                 {
@@ -1955,8 +1959,19 @@ impl Pen {
         self.new_project_open = false;
         self.settings_open = true;
         self.file_menu_open = false;
+        if let OpenPage::Editor(ed) = &mut self.page {
+            ed.focused = false;
+        }
         self.ask_shells();
         let _ = tx;
+    }
+
+    fn close_settings(&mut self, tx: &mut Tx) {
+        self.settings_open = false;
+        if let OpenPage::Editor(ed) = &mut self.page {
+            ed.focused = !self.term_focused;
+        }
+        tx.instant();
     }
 
     fn ask_shells(&mut self) {
@@ -2872,7 +2887,8 @@ fn term_panel(s: &Pen) -> El {
     if s.term_missing {
         return body.child(text("No shell found.").font(UI_FONT).color(faint));
     }
-    for (i, line) in s.term_rows.iter().enumerate() {
+    let start = pen_term::visible_start(s.term_rows.len(), s.term_cursor, 6);
+    for (i, line) in s.term_rows.iter().enumerate().skip(start).take(6) {
         let colors = s.term_colors.get(i).map(Vec::as_slice).unwrap_or(&[]);
         body = body.child(term_row_el(i, line, colors, code, fg));
     }
@@ -3809,7 +3825,7 @@ fn settings_page(s: &Pen, theme: &Theme, reduced: bool) -> El {
             row().child(back_button("pen/settings-back", theme).on_press_tx(
                 |s: &mut Pen, tx: &mut Tx| {
                     s.save_display_name(tx);
-                    s.settings_open = false;
+                    s.close_settings(tx);
                 },
             )),
         )
@@ -4662,10 +4678,17 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
     }
-    if s.settings_open && ev.key == Key::Escape {
-        s.settings_open = false;
-        tx.instant();
-        return true;
+    if s.settings_open {
+        if ev.key == Key::Escape {
+            s.close_settings(tx);
+            return true;
+        }
+        let field = s.name_edit.focused || s.token_edit.focused;
+        if !field {
+            tx.instant();
+            return true;
+        }
+        return false;
     }
     if s.file_search_open {
         match ev.key {
@@ -4712,12 +4735,16 @@ fn on_key(s: &mut Pen, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 tx.instant();
                 return true;
             }
+            Key::Left | Key::Right => {
+                tx.instant();
+                return true;
+            }
             Key::Tab | Key::Enter => {
                 s.accept_completion();
                 tx.instant();
                 return true;
             }
-            _ => {}
+            _ => s.completion = None,
         }
     }
     if ev.key == Key::Tab && !s.term_focused && !s.palette_open && !s.find_open {

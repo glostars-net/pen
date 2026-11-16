@@ -50,7 +50,7 @@ pub enum LspEvent {
     Jump(Jump),
     Completion {
         generation: u64,
-        label: Option<String>,
+        labels: Vec<String>,
     },
 }
 
@@ -144,7 +144,7 @@ fn host(rx: Receiver<LspCmd>, tx: SyncSender<LspEvent>, wake: impl Fn()) {
                         &wake,
                         LspEvent::Completion {
                             generation,
-                            label: None,
+                            labels: Vec::new(),
                         },
                     );
                 }
@@ -347,7 +347,7 @@ impl Session {
         wake: &impl Fn(),
     ) {
         let language = lang_for_path(&rel.to_string_lossy()).unwrap_or("plaintext");
-        let mut label = None;
+        let mut labels = Vec::new();
         for server in &mut self.servers {
             if server.spec.language != language {
                 continue;
@@ -356,13 +356,11 @@ impl Session {
                 continue;
             };
             if let Ok(result) = client.completion(rel, line, character) {
-                label = crate::complete::completion_labels(&result)
-                    .into_iter()
-                    .next();
+                labels = crate::complete::completion_labels(&result);
                 break;
             }
         }
-        emit(tx, wake, LspEvent::Completion { generation, label });
+        emit(tx, wake, LspEvent::Completion { generation, labels });
     }
 
     fn publish(&self, tx: &SyncSender<LspEvent>, wake: &impl Fn()) {
