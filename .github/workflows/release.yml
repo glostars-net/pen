@@ -55,7 +55,7 @@ jobs:
           if ($version -notmatch '^\d+\.\d+\.\d+$') { $version = "0.1.0" }
           Copy-Item target/release/pen.exe packaging/windows/pen.exe
           (Get-Content packaging/windows/pen.wxs) -replace '0\.1\.0\.0', "$version.0" | Set-Content packaging/windows/pen.wxs
-          wix build packaging/windows/pen.wxs -o Pen-Windows.msi -arch x64
+          wix build packaging/windows/pen.wxs -b packaging/windows -o Pen-Windows.msi -arch x64
       - name: Package Linux
         if: runner.os == 'Linux'
         run: |
@@ -74,6 +74,7 @@ jobs:
 
   publish:
     needs: build
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -88,3 +89,4 @@ jobs:
             Pen-Windows.msi
             Pen-Linux.deb
           generate_release_notes: true
+          fail_on_unmatched_files: false
