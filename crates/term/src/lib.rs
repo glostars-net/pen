@@ -238,7 +238,7 @@ impl Shell {
         }
         #[cfg(not(unix))]
         {
-            let child = std::process::Command::new(program)
+            let mut child = std::process::Command::new(program)
                 .current_dir(cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
