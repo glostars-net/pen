@@ -36,16 +36,7 @@ jobs:
         run: cargo build --release -p pen
       - name: Package macOS
         if: runner.os == 'macOS'
-        run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/Pen"
-          mkdir -p "$stage"
-          cp target/release/pen "$stage/pen"
-          chmod 755 "$stage/pen"
-          codesign --sign - --force "$stage/pen"
-          printf '%s\n' '#!/bin/sh' 'cd "$(dirname "$0")"' 'mkdir -p /usr/local/bin' 'cp -f pen /usr/local/bin/pen' 'chmod 755 /usr/local/bin/pen' 'echo "pen is in /usr/local/bin. Open a new terminal and run: pen"' > "$stage/Install Pen.command"
-          chmod 755 "$stage/Install Pen.command"
-          hdiutil create -volname Pen -srcfolder "$stage" -ov -format UDZO Pen-macOS.dmg
+        run: bash packaging/macos/package.sh
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
