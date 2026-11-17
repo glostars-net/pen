@@ -3,3 +3,4 @@ target/
 .deja/
 .worktrees/
 .DS_Store
+plan/ 
